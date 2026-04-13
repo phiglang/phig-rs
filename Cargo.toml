@@ -3,6 +3,7 @@ members = [".", "conformance"]
 
 [package]
 name = "phig"
+description = "Parser and serializer for phig"
 version = "0.1.0"
 edition = "2021"
 

@@ -9,7 +9,7 @@ pub use ser::{to_string, to_value};
 
 use std::fmt;
 
-/// A Phig value: string, list, or map.
+/// A phig value: string, list, or map.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     String(String),
@@ -138,7 +138,8 @@ impl<'a> std::ops::Index<&'a str> for Value {
     type Output = Value;
 
     fn index(&self, key: &'a str) -> &Value {
-        self.get(key).unwrap_or_else(|| panic!("key not found: {}", key))
+        self.get(key)
+            .unwrap_or_else(|| panic!("key not found: {}", key))
     }
 }
 
