@@ -140,8 +140,20 @@ impl<'a> Parser<'a> {
                             result.push('\0');
                             self.pos += 1;
                         }
+                        b'\r' => {
+                            // line continuation: \<CR><LF>
+                            self.pos += 1;
+                            if self.peek() == Some(b'\n') {
+                                self.pos += 1;
+                            } else {
+                                return Err(Error::at(
+                                    "expected LF after CR in line continuation",
+                                    esc_start,
+                                ));
+                            }
+                        }
                         b'\n' => {
-                            // line continuation
+                            // line continuation: \<LF>
                             self.pos += 1;
                         }
                         b'u' => {
