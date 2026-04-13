@@ -85,8 +85,8 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Some(c) = self.next_char() {
-                if c.is_whitespace() {
-                    self.pos += c.len_utf8();
+                if matches!(c, ' ' | '\t' | '\n' | '\r') {
+                    self.pos += 1;
                     continue;
                 }
             }
@@ -213,7 +213,7 @@ impl<'a> Parser<'a> {
     fn bare(&mut self) -> Option<String> {
         let start = self.pos;
         while let Some(c) = self.next_char() {
-            if c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';') {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';') {
                 break;
             }
             self.pos += c.len_utf8();
