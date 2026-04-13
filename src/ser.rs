@@ -1,7 +1,20 @@
+use std::io;
+
 use serde::ser::{self, Serialize};
 
 use crate::error::Error;
 use crate::Value;
+
+/// Serialize a `T` to a phig writer.
+///
+/// The value must serialize as a map (struct, `HashMap`, etc.).
+pub fn to_writer<T: Serialize>(value: &T, mut writer: impl io::Write) -> Result<(), Error> {
+    let val = to_value(value)?;
+    let Value::Map(pairs) = val else {
+        unreachable!("to_value enforces top-level map");
+    };
+    format_map(&pairs, 0, true, &mut writer)
+}
 
 /// Serialize a `T` to a phig string.
 ///
@@ -17,11 +30,9 @@ use crate::Value;
 /// assert_eq!(s, "name app\nport 8080\n");
 /// ```
 pub fn to_string<T: Serialize>(value: &T) -> Result<String, Error> {
-    let val = to_value(value)?;
-    let Value::Map(pairs) = val else {
-        unreachable!("to_value enforces top-level map");
-    };
-    Ok(format_map(&pairs, 0, true))
+    let mut buf = Vec::new();
+    to_writer(value, &mut buf)?;
+    Ok(String::from_utf8(buf).expect("phig output is always valid UTF-8"))
 }
 
 /// Serialize a `T` to a [`Value`].
@@ -35,37 +46,37 @@ pub fn to_value<T: Serialize>(value: &T) -> Result<Value, Error> {
     Ok(val)
 }
 
-fn format_value(v: &Value, indent: usize) -> String {
+fn format_value(v: &Value, indent: usize, w: &mut dyn io::Write) -> Result<(), Error> {
     match v {
-        Value::String(s) => format_string(s),
-        Value::List(items) => format_list(items, indent),
-        Value::Map(pairs) => format_map(pairs, indent, false),
+        Value::String(s) => format_string(s, w),
+        Value::List(items) => format_list(items, indent, w),
+        Value::Map(pairs) => format_map(pairs, indent, false, w),
     }
 }
 
-fn format_string(s: &str) -> String {
+fn format_string(s: &str, w: &mut dyn io::Write) -> Result<(), Error> {
     if can_be_bare(s) {
-        s.to_string()
+        w.write_all(s.as_bytes())?;
     } else {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('"');
+        w.write_all(b"\"")?;
         for c in s.chars() {
             match c {
-                '"' => out.push_str("\\\""),
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\0' => out.push_str("\\0"),
-                c if c.is_control() => {
-                    out.push_str(&format!("\\u{{{:x}}}", c as u32));
+                '"' => w.write_all(b"\\\"")?,
+                '\\' => w.write_all(b"\\\\")?,
+                '\n' => w.write_all(b"\\n")?,
+                '\r' => w.write_all(b"\\r")?,
+                '\t' => w.write_all(b"\\t")?,
+                '\0' => w.write_all(b"\\0")?,
+                c if c.is_control() => write!(w, "\\u{{{:x}}}", c as u32)?,
+                c => {
+                    let mut buf = [0u8; 4];
+                    w.write_all(c.encode_utf8(&mut buf).as_bytes())?;
                 }
-                c => out.push(c),
             }
         }
-        out.push('"');
-        out
+        w.write_all(b"\"")?;
     }
+    Ok(())
 }
 
 fn can_be_bare(s: &str) -> bool {
@@ -75,9 +86,17 @@ fn can_be_bare(s: &str) -> bool {
         })
 }
 
-fn format_list(items: &[Value], indent: usize) -> String {
+fn write_indent(w: &mut dyn io::Write, level: usize) -> Result<(), Error> {
+    for _ in 0..level {
+        w.write_all(b"  ")?;
+    }
+    Ok(())
+}
+
+fn format_list(items: &[Value], indent: usize, w: &mut dyn io::Write) -> Result<(), Error> {
     if items.is_empty() {
-        return "[]".to_string();
+        w.write_all(b"[]")?;
+        return Ok(());
     }
 
     let has_compound = items
@@ -86,50 +105,60 @@ fn format_list(items: &[Value], indent: usize) -> String {
 
     if has_compound {
         let inner = indent + 1;
-        let pad = "  ".repeat(inner);
-        let close_pad = "  ".repeat(indent);
-        let parts: Vec<String> = items
-            .iter()
-            .map(|v| format!("{}{}", pad, format_value(v, inner)))
-            .collect();
-        format!("[\n{}\n{}]", parts.join("\n"), close_pad)
+        w.write_all(b"[\n")?;
+        for item in items {
+            write_indent(w, inner)?;
+            format_value(item, inner, w)?;
+            w.write_all(b"\n")?;
+        }
+        write_indent(w, indent)?;
+        w.write_all(b"]")?;
     } else {
-        let parts: Vec<String> = items.iter().map(|v| format_value(v, indent)).collect();
-        format!("[{}]", parts.join(" "))
+        w.write_all(b"[")?;
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                w.write_all(b" ")?;
+            }
+            format_value(item, indent, w)?;
+        }
+        w.write_all(b"]")?;
     }
+    Ok(())
 }
 
-fn format_map(pairs: &[(String, Value)], indent: usize, top_level: bool) -> String {
+fn format_map(
+    pairs: &[(String, Value)],
+    indent: usize,
+    top_level: bool,
+    w: &mut dyn io::Write,
+) -> Result<(), Error> {
     if pairs.is_empty() {
-        return if top_level {
-            String::new()
-        } else {
-            "{}".to_string()
-        };
+        if !top_level {
+            w.write_all(b"{}")?;
+        }
+        return Ok(());
     }
 
-    let mut out = String::new();
     let inner = if top_level { indent } else { indent + 1 };
-    let pad = "  ".repeat(inner);
 
     if !top_level {
-        out.push_str("{\n");
+        w.write_all(b"{\n")?;
     }
 
     for (k, v) in pairs {
-        out.push_str(&pad);
-        out.push_str(&format_string(k));
-        out.push(' ');
-        out.push_str(&format_value(v, inner));
-        out.push('\n');
+        write_indent(w, inner)?;
+        format_string(k, w)?;
+        w.write_all(b" ")?;
+        format_value(v, inner, w)?;
+        w.write_all(b"\n")?;
     }
 
     if !top_level {
-        out.push_str(&"  ".repeat(indent));
-        out.push('}');
+        write_indent(w, indent)?;
+        w.write_all(b"}")?;
     }
 
-    out
+    Ok(())
 }
 
 struct ValueSerializer;

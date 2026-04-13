@@ -1,8 +1,15 @@
+use std::io::Read;
+
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use crate::error::Error;
 use crate::parse;
 use crate::Value;
+
+/// Deserialize a `T` from a phig reader.
+pub fn from_reader<T: serde::de::DeserializeOwned>(reader: impl Read) -> Result<T, Error> {
+    from_value(parse::parse(reader)?)
+}
 
 /// Deserialize a `T` from a phig string.
 ///
@@ -16,7 +23,7 @@ use crate::Value;
 /// assert_eq!(cfg.port, 8080);
 /// ```
 pub fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Error> {
-    from_value(parse::parse(s)?)
+    from_reader(s.as_bytes())
 }
 
 /// Deserialize a `T` from a [`Value`].

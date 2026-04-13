@@ -1,33 +1,82 @@
+use std::io::Read;
+
 use crate::error::Error;
 use crate::Value;
 
-pub fn parse(src: &str) -> Result<Value, Error> {
-    let mut p = Parser { src, pos: 0 };
-    p.wsc();
+pub fn parse(reader: impl Read) -> Result<Value, Error> {
+    let mut p = Parser::new(reader);
+    p.wsc()?;
     let pairs = p.pairs(None)?;
-    p.wsc();
-    if !p.at_end() {
-        return Err(p.err(&format!("unexpected '{}'", p.next_char().unwrap())));
+    p.wsc()?;
+    if !p.at_end()? {
+        let c = p.peek()?.unwrap();
+        return Err(p.err(&format!("unexpected '{}'", c)));
     }
     Ok(Value::Map(pairs))
 }
 
-struct Parser<'a> {
-    src: &'a str,
+struct Parser<R: Read> {
+    reader: R,
+    buf: Vec<u8>,
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn at_end(&self) -> bool {
-        self.pos >= self.src.len()
+impl<R: Read> Parser<R> {
+    fn new(reader: R) -> Self {
+        Parser {
+            reader,
+            buf: Vec::new(),
+            pos: 0,
+        }
     }
 
-    fn peek(&self) -> Option<u8> {
-        self.src.as_bytes().get(self.pos).copied()
+    /// Ensure at least `n` bytes in the lookahead buffer.
+    fn fill(&mut self, n: usize) -> Result<usize, Error> {
+        while self.buf.len() < n {
+            let mut byte = [0u8; 1];
+            match self.reader.read(&mut byte)? {
+                0 => break,
+                _ => self.buf.push(byte[0]),
+            }
+        }
+        Ok(self.buf.len())
     }
 
-    fn next_char(&self) -> Option<char> {
-        self.src[self.pos..].chars().next()
+    fn at_end(&mut self) -> Result<bool, Error> {
+        Ok(self.fill(1)? == 0)
+    }
+
+    fn peek(&mut self) -> Result<Option<char>, Error> {
+        if self.fill(1)? == 0 {
+            return Ok(None);
+        }
+        let first = self.buf[0];
+        let len = match first {
+            0x00..0x80 => 1,
+            0xC0..0xE0 => 2,
+            0xE0..0xF0 => 3,
+            0xF0..0xF8 => 4,
+            _ => return Err(Error::at("invalid UTF-8", self.pos)),
+        };
+        if self.fill(len)? < len {
+            return Err(Error::at("incomplete UTF-8 character", self.pos));
+        }
+        match std::str::from_utf8(&self.buf[..len]) {
+            Ok(s) => Ok(s.chars().next()),
+            Err(_) => Err(Error::at("invalid UTF-8", self.pos)),
+        }
+    }
+
+    fn advance(&mut self) -> Result<Option<char>, Error> {
+        let c = match self.peek()? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        for _ in 0..c.len_utf8() {
+            self.buf.remove(0);
+            self.pos += 1;
+        }
+        Ok(Some(c))
     }
 
     fn err(&self, msg: &str) -> Error {
@@ -35,116 +84,122 @@ impl<'a> Parser<'a> {
     }
 
     // HSPACE = /[ \t]+/
-    fn hspace(&mut self) -> bool {
+    fn hspace(&mut self) -> Result<bool, Error> {
         let start = self.pos;
-        while let Some(b' ' | b'\t') = self.peek() {
-            self.pos += 1;
+        while matches!(self.peek()?, Some(' ' | '\t')) {
+            self.advance()?;
         }
-        self.pos > start
+        Ok(self.pos > start)
     }
 
     // PAIRSEP = /(\r?\n)+|;/
-    fn pairsep(&mut self) -> bool {
-        if self.peek() == Some(b';') {
-            self.pos += 1;
-            return true;
+    fn pairsep(&mut self) -> Result<bool, Error> {
+        if self.peek()? == Some(';') {
+            self.advance()?;
+            return Ok(true);
         }
         let start = self.pos;
         loop {
-            match self.peek() {
-                Some(b'\n') => self.pos += 1,
-                Some(b'\r') if self.src.as_bytes().get(self.pos + 1) == Some(&b'\n') => {
-                    self.pos += 2;
+            match self.peek()? {
+                Some('\n') => {
+                    self.advance()?;
+                }
+                Some('\r') => {
+                    self.advance()?;
+                    if self.peek()? == Some('\n') {
+                        self.advance()?;
+                    }
                 }
                 _ => break,
             }
         }
-        self.pos > start
+        Ok(self.pos > start)
     }
 
     // COMMENT = '#' /[^\n]*/
-    fn comment(&mut self) -> bool {
-        if self.peek() == Some(b'#') {
-            while let Some(b) = self.peek() {
-                if b == b'\n' {
-                    break;
+    fn comment(&mut self) -> Result<bool, Error> {
+        if self.peek()? == Some('#') {
+            loop {
+                match self.peek()? {
+                    Some('\n') | None => break,
+                    _ => {
+                        self.advance()?;
+                    }
                 }
-                self.pos += 1;
             }
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
     // _ = { WS | COMMENT }
-    fn wsc(&mut self) {
+    fn wsc(&mut self) -> Result<(), Error> {
         loop {
-            if self.peek() == Some(b'#') {
-                self.comment();
-                continue;
-            }
-            if let Some(c) = self.next_char() {
-                if matches!(c, ' ' | '\t' | '\n' | '\r') {
-                    self.pos += 1;
-                    continue;
+            match self.peek()? {
+                Some('#') => {
+                    self.comment()?;
                 }
+                Some(' ' | '\t' | '\n' | '\r') => {
+                    self.advance()?;
+                }
+                _ => break,
             }
-            break;
         }
+        Ok(())
     }
 
     // QSTRING = '"' { QCHAR } '"'
     fn qstring(&mut self) -> Result<String, Error> {
         let open = self.pos;
-        self.pos += 1; // skip "
+        self.advance()?; // skip "
 
         let mut result = String::new();
         loop {
-            if self.at_end() {
+            let Some(ch) = self.peek()? else {
                 return Err(Error::at("unterminated string", open));
-            }
-            match self.src.as_bytes()[self.pos] {
-                b'"' => {
-                    self.pos += 1;
+            };
+            match ch {
+                '"' => {
+                    self.advance()?;
                     return Ok(result);
                 }
-                b'\\' => {
+                '\\' => {
                     let esc_start = self.pos;
-                    self.pos += 1;
-                    if self.at_end() {
+                    self.advance()?;
+                    let Some(esc) = self.peek()? else {
                         return Err(Error::at("unterminated escape", esc_start));
-                    }
-                    match self.src.as_bytes()[self.pos] {
-                        b'n' => {
+                    };
+                    match esc {
+                        'n' => {
                             result.push('\n');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'r' => {
+                        'r' => {
                             result.push('\r');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b't' => {
+                        't' => {
                             result.push('\t');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'\\' => {
+                        '\\' => {
                             result.push('\\');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'"' => {
+                        '"' => {
                             result.push('"');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'0' => {
+                        '0' => {
                             result.push('\0');
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'\r' => {
+                        '\r' => {
                             // line continuation: \<CR><LF>
-                            self.pos += 1;
-                            if self.peek() == Some(b'\n') {
-                                self.pos += 1;
+                            self.advance()?;
+                            if self.peek()? == Some('\n') {
+                                self.advance()?;
                             } else {
                                 return Err(Error::at(
                                     "expected LF after CR in line continuation",
@@ -152,36 +207,38 @@ impl<'a> Parser<'a> {
                                 ));
                             }
                         }
-                        b'\n' => {
+                        '\n' => {
                             // line continuation: \<LF>
-                            self.pos += 1;
+                            self.advance()?;
                         }
-                        b'u' => {
-                            self.pos += 1;
-                            if self.at_end() || self.src.as_bytes()[self.pos] != b'{' {
+                        'u' => {
+                            self.advance()?;
+                            if self.peek()? != Some('{') {
                                 return Err(Error::at("expected '{' after \\u", esc_start));
                             }
-                            self.pos += 1; // skip {
+                            self.advance()?; // skip {
 
-                            let hex_start = self.pos;
-                            while !self.at_end() && self.src.as_bytes()[self.pos] != b'}' {
-                                if !self.src.as_bytes()[self.pos].is_ascii_hexdigit() {
+                            let mut hex = String::new();
+                            loop {
+                                let Some(hc) = self.peek()? else {
+                                    return Err(Error::at("invalid unicode escape", esc_start));
+                                };
+                                if hc == '}' {
+                                    break;
+                                }
+                                if !hc.is_ascii_hexdigit() {
                                     return Err(Error::at("invalid unicode escape", esc_start));
                                 }
-                                self.pos += 1;
+                                hex.push(hc);
+                                self.advance()?;
                             }
 
-                            let hex = &self.src[hex_start..self.pos];
-                            if hex.is_empty()
-                                || hex.len() > 6
-                                || self.at_end()
-                                || self.src.as_bytes()[self.pos] != b'}'
-                            {
+                            if hex.is_empty() || hex.len() > 6 {
                                 return Err(Error::at("invalid unicode escape", esc_start));
                             }
-                            self.pos += 1; // skip }
+                            self.advance()?; // skip }
 
-                            let cp = u32::from_str_radix(hex, 16)
+                            let cp = u32::from_str_radix(&hex, 16)
                                 .map_err(|_| Error::at("invalid unicode escape", esc_start))?;
                             let c = char::from_u32(cp).ok_or_else(|| {
                                 Error::at("unicode codepoint out of range", esc_start)
@@ -189,16 +246,16 @@ impl<'a> Parser<'a> {
                             result.push(c);
                         }
                         _ => {
-                            let c = self.next_char().unwrap();
-                            self.pos += c.len_utf8();
-                            return Err(Error::at(&format!("invalid escape '\\{}'", c), esc_start));
+                            self.advance()?;
+                            return Err(Error::at(
+                                &format!("invalid escape '\\{}'", esc),
+                                esc_start,
+                            ));
                         }
                     }
                 }
                 _ => {
-                    let c = self.next_char().unwrap();
-                    result.push(c);
-                    self.pos += c.len_utf8();
+                    result.push(self.advance()?.unwrap());
                 }
             }
         }
@@ -207,50 +264,52 @@ impl<'a> Parser<'a> {
     // QRSTRING = "'" /[^']*/ "'"
     fn qrstring(&mut self) -> Result<String, Error> {
         let open = self.pos;
-        self.pos += 1; // skip '
-        let start = self.pos;
-        while !self.at_end() && self.src.as_bytes()[self.pos] != b'\'' {
-            self.pos += 1;
-        }
-        let content = self.src[start..self.pos].to_string();
-        if !self.at_end() && self.src.as_bytes()[self.pos] == b'\'' {
-            self.pos += 1;
-            Ok(content)
-        } else {
-            Err(Error::at("unterminated raw string", open))
+        self.advance()?; // skip '
+        let mut result = String::new();
+        loop {
+            let Some(ch) = self.peek()? else {
+                return Err(Error::at("unterminated raw string", open));
+            };
+            if ch == '\'' {
+                self.advance()?;
+                return Ok(result);
+            }
+            result.push(self.advance()?.unwrap());
         }
     }
 
     // BARE = /[^\p{White_Space}{}[\]"#';]+/
-    fn bare(&mut self) -> Option<String> {
-        let start = self.pos;
-        while let Some(c) = self.next_char() {
+    fn bare(&mut self) -> Result<Option<String>, Error> {
+        let mut result = String::new();
+        loop {
+            let Some(c) = self.peek()? else { break };
             if c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';') {
                 break;
             }
-            self.pos += c.len_utf8();
+            self.advance()?;
+            result.push(c);
         }
-        if self.pos > start {
-            Some(self.src[start..self.pos].to_string())
+        if result.is_empty() {
+            Ok(None)
         } else {
-            None
+            Ok(Some(result))
         }
     }
 
     // string = QSTRING | QRSTRING | BARE
     fn string(&mut self) -> Result<Option<String>, Error> {
-        match self.peek() {
-            Some(b'"') => self.qstring().map(Some),
-            Some(b'\'') => self.qrstring().map(Some),
-            _ => Ok(self.bare()),
+        match self.peek()? {
+            Some('"') => self.qstring().map(Some),
+            Some('\'') => self.qrstring().map(Some),
+            _ => self.bare(),
         }
     }
 
     // value = map | list | string
     fn value(&mut self) -> Result<Option<Value>, Error> {
-        match self.peek() {
-            Some(b'{') => self.map().map(Some),
-            Some(b'[') => self.list().map(Some),
+        match self.peek()? {
+            Some('{') => self.map().map(Some),
+            Some('[') => self.list().map(Some),
             _ => match self.string()? {
                 Some(s) => Ok(Some(Value::String(s))),
                 None => Ok(None),
@@ -273,7 +332,7 @@ impl<'a> Parser<'a> {
             return Err(Error::at(&format!("duplicate key '{}'", key), start));
         }
 
-        self.hspace();
+        self.hspace()?;
 
         let val = match self.value()? {
             Some(v) => v,
@@ -285,42 +344,41 @@ impl<'a> Parser<'a> {
             }
         };
 
-        self.hspace();
-        self.comment();
+        self.hspace()?;
+        self.comment()?;
 
         Ok(Some((key, val)))
     }
 
     // pairs = pair { PAIRSEP _ pair }
-    fn pairs(&mut self, closing: Option<u8>) -> Result<Vec<(String, Value)>, Error> {
+    fn pairs(&mut self, closing: Option<char>) -> Result<Vec<(String, Value)>, Error> {
         let mut pairs = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
         loop {
-            if self.at_end() || self.peek() == closing {
+            if self.at_end()? || self.peek()? == closing {
                 break;
             }
 
             match self.pair(&mut seen)? {
                 Some((k, v)) => pairs.push((k, v)),
                 None => {
-                    if !self.at_end() && self.peek() != closing {
-                        return Err(
-                            self.err(&format!("unexpected '{}'", self.next_char().unwrap()))
-                        );
+                    if !self.at_end()? && self.peek()? != closing {
+                        let c = self.peek()?.unwrap();
+                        return Err(self.err(&format!("unexpected '{}'", c)));
                     }
                     break;
                 }
             }
 
-            if self.at_end() || self.peek() == closing {
+            if self.at_end()? || self.peek()? == closing {
                 break;
             }
 
-            if !self.pairsep() {
+            if !self.pairsep()? {
                 return Err(self.err("expected newline or ';' after value"));
             }
-            self.wsc();
+            self.wsc()?;
         }
 
         Ok(pairs)
@@ -329,12 +387,12 @@ impl<'a> Parser<'a> {
     // map = '{' _ [ pairs ] _ '}'
     fn map(&mut self) -> Result<Value, Error> {
         let open = self.pos;
-        self.pos += 1; // skip {
-        self.wsc();
-        let pairs = self.pairs(Some(b'}'))?;
-        self.wsc();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
+        self.advance()?; // skip {
+        self.wsc()?;
+        let pairs = self.pairs(Some('}'))?;
+        self.wsc()?;
+        if self.peek()? == Some('}') {
+            self.advance()?;
             Ok(Value::Map(pairs))
         } else {
             Err(Error::at("unclosed '{'", open))
@@ -346,31 +404,30 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
 
         loop {
-            if self.at_end() || self.peek() == Some(b']') {
+            if self.at_end()? || self.peek()? == Some(']') {
                 break;
             }
 
             match self.value()? {
                 Some(v) => items.push(v),
                 None => {
-                    if !self.at_end() && self.peek() != Some(b']') {
-                        return Err(
-                            self.err(&format!("unexpected '{}'", self.next_char().unwrap()))
-                        );
+                    if !self.at_end()? && self.peek()? != Some(']') {
+                        let c = self.peek()?.unwrap();
+                        return Err(self.err(&format!("unexpected '{}'", c)));
                     }
                     break;
                 }
             }
 
-            if self.at_end() || self.peek() == Some(b']') {
+            if self.at_end()? || self.peek()? == Some(']') {
                 break;
             }
 
-            self.wsc();
-            if self.peek() == Some(b';') {
-                self.pos += 1;
+            self.wsc()?;
+            if self.peek()? == Some(';') {
+                self.advance()?;
             }
-            self.wsc();
+            self.wsc()?;
         }
 
         Ok(items)
@@ -379,12 +436,12 @@ impl<'a> Parser<'a> {
     // list = '[' _ [ items ] _ ']'
     fn list(&mut self) -> Result<Value, Error> {
         let open = self.pos;
-        self.pos += 1; // skip [
-        self.wsc();
+        self.advance()?; // skip [
+        self.wsc()?;
         let items = self.items()?;
-        self.wsc();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
+        self.wsc()?;
+        if self.peek()? == Some(']') {
+            self.advance()?;
             Ok(Value::List(items))
         } else {
             Err(Error::at("unclosed '['", open))
@@ -402,13 +459,13 @@ mod tests {
 
     #[test]
     fn bare_pairs() {
-        let v = parse("name foo").unwrap();
+        let v = parse("name foo".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("name".into(), s("foo"))]));
     }
 
     #[test]
     fn multiple_pairs() {
-        let v = parse("a 1\nb 2").unwrap();
+        let v = parse("a 1\nb 2".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![("a".into(), s("1")), ("b".into(), s("2"))])
@@ -417,7 +474,7 @@ mod tests {
 
     #[test]
     fn semicolon_sep() {
-        let v = parse("a 1; b 2").unwrap();
+        let v = parse("a 1; b 2".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![("a".into(), s("1")), ("b".into(), s("2"))])
@@ -426,7 +483,7 @@ mod tests {
 
     #[test]
     fn nested_map() {
-        let v = parse("x { a 1; b 2 }").unwrap();
+        let v = parse("x { a 1; b 2 }".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![(
@@ -438,7 +495,7 @@ mod tests {
 
     #[test]
     fn list() {
-        let v = parse("tags [a b c]").unwrap();
+        let v = parse("tags [a b c]".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![(
@@ -450,102 +507,102 @@ mod tests {
 
     #[test]
     fn quoted_string() {
-        let v = parse(r#"msg "hello\nworld""#).unwrap();
+        let v = parse(r#"msg "hello\nworld""#.as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("msg".into(), s("hello\nworld"))]));
     }
 
     #[test]
     fn raw_string() {
-        let v = parse(r"path 'C:\foo\bar'").unwrap();
+        let v = parse(r"path 'C:\foo\bar'".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("path".into(), s(r"C:\foo\bar"))]));
     }
 
     #[test]
     fn unicode_escape() {
-        let v = parse(r#"ch "\u{1f331}""#).unwrap();
+        let v = parse(r#"ch "\u{1f331}""#.as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("ch".into(), s("\u{1f331}"))]))
     }
 
     #[test]
     fn comment() {
-        let v = parse("# header\na 1 # inline\n").unwrap();
+        let v = parse("# header\na 1 # inline\n".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("a".into(), s("1"))]));
     }
 
     #[test]
     fn line_continuation() {
-        let v = parse("msg \"hello \\\nworld\"").unwrap();
+        let v = parse("msg \"hello \\\nworld\"".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("msg".into(), s("hello world"))]));
     }
 
     #[test]
     fn empty() {
-        let v = parse("").unwrap();
+        let v = parse("".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![]));
     }
 
     #[test]
     fn whitespace_only() {
-        let v = parse("  \n\n  ").unwrap();
+        let v = parse("  \n\n  ".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![]));
     }
 
     #[test]
     fn unclosed_brace() {
-        assert!(parse("x {").is_err());
+        assert!(parse("x {".as_bytes()).is_err());
     }
 
     #[test]
     fn unclosed_bracket() {
-        assert!(parse("x [").is_err());
+        assert!(parse("x [".as_bytes()).is_err());
     }
 
     #[test]
     fn unterminated_string() {
-        assert!(parse(r#"x "hello"#).is_err());
+        assert!(parse(r#"x "hello"#.as_bytes()).is_err());
     }
 
     #[test]
     fn invalid_escape() {
-        assert!(parse(r#"x "\q""#).is_err());
+        assert!(parse(r#"x "\q""#.as_bytes()).is_err());
     }
 
     #[test]
     fn duplicate_key_toplevel() {
-        let e = parse("a 1\na 2").unwrap_err();
+        let e = parse("a 1\na 2".as_bytes()).unwrap_err();
         assert!(e.msg.contains("duplicate key 'a'"), "{}", e.msg);
     }
 
     #[test]
     fn duplicate_key_nested() {
-        let e = parse("x { k 1; k 2 }").unwrap_err();
+        let e = parse("x { k 1; k 2 }".as_bytes()).unwrap_err();
         assert!(e.msg.contains("duplicate key 'k'"), "{}", e.msg);
     }
 
     #[test]
     fn nbsp_not_separator() {
-        assert!(parse("name\u{00a0}foo").is_err());
+        assert!(parse("name\u{00a0}foo".as_bytes()).is_err());
     }
 
     #[test]
     fn nbsp_in_bare_value() {
-        assert!(parse("name foo\u{00a0}bar").is_err());
+        assert!(parse("name foo\u{00a0}bar".as_bytes()).is_err());
     }
 
     #[test]
     fn em_space_in_bare_value() {
-        assert!(parse("name foo\u{2003}bar").is_err());
+        assert!(parse("name foo\u{2003}bar".as_bytes()).is_err());
     }
 
     #[test]
     fn nbsp_in_quoted_ok() {
-        let v = parse("name \"foo\u{00a0}bar\"").unwrap();
+        let v = parse("name \"foo\u{00a0}bar\"".as_bytes()).unwrap();
         assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
     }
 
     #[test]
     fn nbsp_in_raw_ok() {
-        let v = parse("name 'foo\u{00a0}bar'").unwrap();
+        let v = parse("name 'foo\u{00a0}bar'".as_bytes()).unwrap();
         assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
     }
 }

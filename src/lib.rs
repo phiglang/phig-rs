@@ -35,9 +35,9 @@ mod error;
 mod parse;
 mod ser;
 
-pub use de::{from_str, from_value};
+pub use de::{from_reader, from_str, from_value};
 pub use error::Error;
-pub use ser::{to_string, to_value};
+pub use ser::{to_string, to_value, to_writer};
 
 use std::fmt;
 
@@ -101,7 +101,7 @@ impl std::str::FromStr for Value {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse::parse(s)
+        parse::parse(s.as_bytes())
     }
 }
 
