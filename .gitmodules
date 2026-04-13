@@ -1,0 +1,3 @@
+[submodule "conformance/testdata"]
+	path = conformance/testdata
+	url = https://github.com/phiglang/testdata

@@ -1,0 +1,9 @@
+[package]
+name = "phig-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+phig = { path = ".." }
+serde_json = { version = "1", features = ["preserve_order"] }
