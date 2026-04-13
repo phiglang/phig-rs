@@ -426,7 +426,7 @@ impl ser::SerializeStructVariant for StructVariantCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
 
     #[test]
     fn simple_struct() {
@@ -548,5 +548,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(s, "name \"\"\n");
+    }
+
+    #[test]
+    fn nbsp_quoted_roundtrip() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct Config {
+            name: String,
+        }
+
+        let cfg = Config {
+            name: "foo\u{00a0}bar".into(),
+        };
+        let s = to_string(&cfg).unwrap();
+        assert!(s.contains('"'), "nbsp value must be quoted");
+        let cfg2: Config = crate::from_str(&s).unwrap();
+        assert_eq!(cfg, cfg2);
     }
 }

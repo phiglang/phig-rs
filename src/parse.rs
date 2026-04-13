@@ -509,4 +509,31 @@ mod tests {
         let e = parse("x { k 1; k 2 }").unwrap_err();
         assert!(e.msg.contains("duplicate key 'k'"), "{}", e.msg);
     }
+
+    #[test]
+    fn nbsp_not_separator() {
+        assert!(parse("name\u{00a0}foo").is_err());
+    }
+
+    #[test]
+    fn nbsp_in_bare_value() {
+        assert!(parse("name foo\u{00a0}bar").is_err());
+    }
+
+    #[test]
+    fn em_space_in_bare_value() {
+        assert!(parse("name foo\u{2003}bar").is_err());
+    }
+
+    #[test]
+    fn nbsp_in_quoted_ok() {
+        let v = parse("name \"foo\u{00a0}bar\"").unwrap();
+        assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
+    }
+
+    #[test]
+    fn nbsp_in_raw_ok() {
+        let v = parse("name 'foo\u{00a0}bar'").unwrap();
+        assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
+    }
 }
