@@ -209,11 +209,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // BARE = /[^\s{}\[\]"#';]+/
+    // BARE = /[^\p{White_Space}{}[\]"#';]+/
     fn bare(&mut self) -> Option<String> {
         let start = self.pos;
         while let Some(c) = self.next_char() {
-            if matches!(c, ' ' | '\t' | '\n' | '\r' | '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';') {
+            if c.is_whitespace() || matches!(c, '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';') {
                 break;
             }
             self.pos += c.len_utf8();
