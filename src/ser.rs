@@ -3,6 +3,19 @@ use serde::ser::{self, Serialize};
 use crate::error::Error;
 use crate::Value;
 
+/// Serialize a `T` to a phig string.
+///
+/// The value must serialize as a map (struct, `HashMap`, etc.).
+///
+/// ```
+/// use serde::Serialize;
+///
+/// #[derive(Serialize)]
+/// struct Config { name: String, port: u16 }
+///
+/// let s = phig::to_string(&Config { name: "app".into(), port: 8080 }).unwrap();
+/// assert_eq!(s, "name app\nport 8080\n");
+/// ```
 pub fn to_string<T: Serialize>(value: &T) -> Result<String, Error> {
     let val = to_value(value)?;
     let Value::Map(pairs) = val else {
@@ -11,6 +24,9 @@ pub fn to_string<T: Serialize>(value: &T) -> Result<String, Error> {
     Ok(format_map(&pairs, 0, true))
 }
 
+/// Serialize a `T` to a [`Value`].
+///
+/// The value must serialize as a map.
 pub fn to_value<T: Serialize>(value: &T) -> Result<Value, Error> {
     let val = value.serialize(ValueSerializer)?;
     if !matches!(val, Value::Map(_)) {

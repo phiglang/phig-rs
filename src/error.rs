@@ -1,12 +1,18 @@
 use std::fmt;
 
+/// An error from parsing or serializing phig.
+///
+/// Contains a human-readable message and an optional byte position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
+    /// The error message.
     pub msg: String,
+    /// Byte offset in the input where the error occurred, if applicable.
     pub pos: Option<usize>,
 }
 
 impl Error {
+    /// Create an error with no position.
     pub fn new(msg: impl Into<String>) -> Self {
         Error {
             msg: msg.into(),

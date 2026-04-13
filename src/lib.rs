@@ -1,3 +1,35 @@
+//! Parser and serializer for the [phig](https://phiglang.github.io) configuration language.
+//!
+//! Phig has three types: strings, lists, and maps. Type coercion (to numbers,
+//! booleans, etc.) is handled automatically via serde.
+//!
+//! # Examples
+//!
+//! Deserialize into a struct:
+//!
+//! ```
+//! use serde::Deserialize;
+//!
+//! #[derive(Deserialize)]
+//! struct Config {
+//!     name: String,
+//!     port: u16,
+//!     tags: Vec<String>,
+//! }
+//!
+//! let cfg: Config = phig::from_str("name app\nport 8080\ntags [web prod]").unwrap();
+//! assert_eq!(cfg.name, "app");
+//! assert_eq!(cfg.port, 8080);
+//! ```
+//!
+//! Work with untyped values:
+//!
+//! ```
+//! let val: phig::Value = "name foo\ntags [a b c]".parse().unwrap();
+//! assert_eq!(val["name"].as_str(), Some("foo"));
+//! assert_eq!(val["tags"][0].as_str(), Some("a"));
+//! ```
+
 mod de;
 mod error;
 mod parse;
@@ -9,15 +41,30 @@ pub use ser::{to_string, to_value};
 
 use std::fmt;
 
-/// A phig value: string, list, or map.
+/// A dynamically-typed phig value.
+///
+/// Phig has three types: strings, ordered lists, and ordered maps with
+/// unique string keys. Use the accessor methods ([`as_str`](Value::as_str),
+/// [`as_list`](Value::as_list), [`as_map`](Value::as_map)) or index
+/// directly with `&str` / `usize`.
+///
+/// ```
+/// let v: phig::Value = "name foo\ntags [a b]".parse().unwrap();
+/// assert_eq!(v["name"].as_str(), Some("foo"));
+/// assert_eq!(v["tags"][1].as_str(), Some("b"));
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// A string.
     String(String),
+    /// An ordered sequence of values.
     List(Vec<Value>),
+    /// An ordered sequence of key-value pairs with unique string keys.
     Map(Vec<(String, Value)>),
 }
 
 impl Value {
+    /// Returns the string contents if this is a `Value::String`.
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),
@@ -25,6 +72,7 @@ impl Value {
         }
     }
 
+    /// Returns the items if this is a `Value::List`.
     pub fn as_list(&self) -> Option<&[Value]> {
         match self {
             Value::List(v) => Some(v),
@@ -32,6 +80,7 @@ impl Value {
         }
     }
 
+    /// Returns the key-value pairs if this is a `Value::Map`.
     pub fn as_map(&self) -> Option<&[(String, Value)]> {
         match self {
             Value::Map(m) => Some(m),
@@ -39,6 +88,7 @@ impl Value {
         }
     }
 
+    /// Looks up a key in a map. Returns `None` if not a map or key is absent.
     pub fn get(&self, key: &str) -> Option<&Value> {
         match self {
             Value::Map(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),

@@ -4,10 +4,22 @@ use crate::error::Error;
 use crate::parse;
 use crate::Value;
 
+/// Deserialize a `T` from a phig string.
+///
+/// ```
+/// use serde::Deserialize;
+///
+/// #[derive(Deserialize)]
+/// struct Config { name: String, port: u16 }
+///
+/// let cfg: Config = phig::from_str("name app\nport 8080").unwrap();
+/// assert_eq!(cfg.port, 8080);
+/// ```
 pub fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Error> {
     from_value(parse::parse(s)?)
 }
 
+/// Deserialize a `T` from a [`Value`].
 pub fn from_value<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, Error> {
     if !matches!(value, Value::Map(_)) {
         return Err(Error::new("top-level value must be a map"));
