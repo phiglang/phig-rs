@@ -1,18 +1,155 @@
+//! Event-driven parser for the phig format.
+
 use std::io::Read;
 
 use crate::error::Error;
 use crate::Value;
 
-pub fn parse(reader: impl Read) -> Result<Value, Error> {
+/// Handler for phig parser events.
+///
+/// Implement this trait to receive events from [`parse_events`] without
+/// constructing an intermediate [`Value`] tree.
+pub trait Handler {
+    /// The error type returned by handler methods.
+    type Error: From<Error>;
+
+    /// Called when a map begins (`{` or the implicit top-level map).
+    fn map_start(&mut self) -> Result<(), Self::Error>;
+    /// Called when a map ends (`}` or the implicit top-level map).
+    fn map_end(&mut self) -> Result<(), Self::Error>;
+    /// Called when a list begins (`[`).
+    fn list_start(&mut self) -> Result<(), Self::Error>;
+    /// Called when a list ends (`]`).
+    fn list_end(&mut self) -> Result<(), Self::Error>;
+    /// Called for each key in a map, immediately before its value event.
+    fn key(&mut self, key: String) -> Result<(), Self::Error>;
+    /// Called for each string value.
+    fn string(&mut self, value: String) -> Result<(), Self::Error>;
+}
+
+struct ValueBuilder {
+    stack: Vec<BuildFrame>,
+    result: Option<Value>,
+}
+
+enum BuildFrame {
+    Map {
+        pairs: Vec<(String, Value)>,
+        pending_key: Option<String>,
+    },
+    List {
+        items: Vec<Value>,
+    },
+}
+
+impl ValueBuilder {
+    /// Create a new builder.
+    pub fn new() -> Self {
+        ValueBuilder {
+            stack: Vec::new(),
+            result: None,
+        }
+    }
+
+    /// Consume the builder and return the parsed value.
+    pub fn finish(self) -> Value {
+        self.result.expect("no value produced")
+    }
+
+    fn push_value(&mut self, value: Value) {
+        match self.stack.last_mut() {
+            Some(BuildFrame::Map { pairs, pending_key }) => {
+                let key = pending_key.take().expect("map value without key");
+                pairs.push((key, value));
+            }
+            Some(BuildFrame::List { items }) => {
+                items.push(value);
+            }
+            None => {
+                self.result = Some(value);
+            }
+        }
+    }
+}
+
+impl Default for ValueBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Handler for ValueBuilder {
+    type Error = Error;
+
+    fn map_start(&mut self) -> Result<(), Error> {
+        self.stack.push(BuildFrame::Map {
+            pairs: Vec::new(),
+            pending_key: None,
+        });
+        Ok(())
+    }
+
+    fn map_end(&mut self) -> Result<(), Error> {
+        let frame = self.stack.pop().expect("unbalanced map_end");
+        let value = match frame {
+            BuildFrame::Map { pairs, .. } => Value::Map(pairs),
+            _ => panic!("map_end on non-map frame"),
+        };
+        self.push_value(value);
+        Ok(())
+    }
+
+    fn list_start(&mut self) -> Result<(), Error> {
+        self.stack.push(BuildFrame::List { items: Vec::new() });
+        Ok(())
+    }
+
+    fn list_end(&mut self) -> Result<(), Error> {
+        let frame = self.stack.pop().expect("unbalanced list_end");
+        let value = match frame {
+            BuildFrame::List { items } => Value::List(items),
+            _ => panic!("list_end on non-list frame"),
+        };
+        self.push_value(value);
+        Ok(())
+    }
+
+    fn key(&mut self, key: String) -> Result<(), Error> {
+        match self.stack.last_mut() {
+            Some(BuildFrame::Map { pending_key, .. }) => {
+                *pending_key = Some(key);
+            }
+            _ => panic!("key outside of map"),
+        }
+        Ok(())
+    }
+
+    fn string(&mut self, value: String) -> Result<(), Error> {
+        self.push_value(Value::String(value));
+        Ok(())
+    }
+}
+
+/// Parse phig input and send events to a [`Handler`].
+pub fn parse_events<H: Handler>(reader: impl Read, handler: &mut H) -> Result<(), H::Error> {
     let mut p = Parser::new(reader);
     p.wsc()?;
-    let pairs = p.pairs(None)?;
+    handler.map_start()?;
+    p.pairs(None, handler)?;
+    handler.map_end()?;
     p.wsc()?;
     if !p.at_end()? {
         let c = p.peek()?.unwrap();
-        return Err(p.err(&format!("unexpected '{}'", c)));
+        return Err(p.err(&format!("unexpected '{}'", c)).into());
     }
-    Ok(Value::Map(pairs))
+    Ok(())
+}
+
+/// Parse phig input into a [`Value`] tree.
+pub(crate) fn parse(reader: impl Read) -> Result<Value, Error> {
+    let mut builder = ValueBuilder::new();
+    parse_events(reader, &mut builder)?;
+    Ok(builder.finish())
 }
 
 struct Parser<R: Read> {
@@ -306,53 +443,61 @@ impl<R: Read> Parser<R> {
     }
 
     // value = map | list | string
-    fn value(&mut self) -> Result<Option<Value>, Error> {
+    fn value<H: Handler>(&mut self, handler: &mut H) -> Result<bool, H::Error> {
         match self.peek()? {
-            Some('{') => self.map().map(Some),
-            Some('[') => self.list().map(Some),
+            Some('{') => {
+                self.map(handler)?;
+                Ok(true)
+            }
+            Some('[') => {
+                self.list(handler)?;
+                Ok(true)
+            }
             _ => match self.string()? {
-                Some(s) => Ok(Some(Value::String(s))),
-                None => Ok(None),
+                Some(s) => {
+                    handler.string(s)?;
+                    Ok(true)
+                }
+                None => Ok(false),
             },
         }
     }
 
     // pair = string HSPACE value [ HSPACE ] [ COMMENT ]
-    fn pair(
+    fn pair<H: Handler>(
         &mut self,
         seen: &mut std::collections::HashSet<String>,
-    ) -> Result<Option<(String, Value)>, Error> {
+        handler: &mut H,
+    ) -> Result<bool, H::Error> {
         let start = self.pos;
         let key = match self.string()? {
             Some(k) => k,
-            None => return Ok(None),
+            None => return Ok(false),
         };
 
         if !seen.insert(key.clone()) {
-            return Err(Error::at(&format!("duplicate key '{}'", key), start));
+            return Err(Error::at(&format!("duplicate key '{}'", key), start).into());
         }
 
         self.hspace()?;
+        handler.key(key)?;
 
-        let val = match self.value()? {
-            Some(v) => v,
-            None => {
-                return Err(Error::at(
-                    &format!("expected value for key '{}'", key),
-                    self.pos,
-                ))
-            }
-        };
+        if !self.value(handler)? {
+            return Err(self.err("expected value after key").into());
+        }
 
         self.hspace()?;
         self.comment()?;
 
-        Ok(Some((key, val)))
+        Ok(true)
     }
 
     // pairs = pair { PAIRSEP _ pair }
-    fn pairs(&mut self, closing: Option<char>) -> Result<Vec<(String, Value)>, Error> {
-        let mut pairs = Vec::new();
+    fn pairs<H: Handler>(
+        &mut self,
+        closing: Option<char>,
+        handler: &mut H,
+    ) -> Result<(), H::Error> {
         let mut seen = std::collections::HashSet::new();
 
         loop {
@@ -360,15 +505,12 @@ impl<R: Read> Parser<R> {
                 break;
             }
 
-            match self.pair(&mut seen)? {
-                Some((k, v)) => pairs.push((k, v)),
-                None => {
-                    if !self.at_end()? && self.peek()? != closing {
-                        let c = self.peek()?.unwrap();
-                        return Err(self.err(&format!("unexpected '{}'", c)));
-                    }
-                    break;
+            if !self.pair(&mut seen, handler)? {
+                if !self.at_end()? && self.peek()? != closing {
+                    let c = self.peek()?.unwrap();
+                    return Err(self.err(&format!("unexpected '{}'", c)).into());
                 }
+                break;
             }
 
             if self.at_end()? || self.peek()? == closing {
@@ -376,47 +518,44 @@ impl<R: Read> Parser<R> {
             }
 
             if !self.pairsep()? {
-                return Err(self.err("expected newline or ';' after value"));
+                return Err(self.err("expected newline or ';' after value").into());
             }
             self.wsc()?;
         }
 
-        Ok(pairs)
+        Ok(())
     }
 
     // map = '{' _ [ pairs ] _ '}'
-    fn map(&mut self) -> Result<Value, Error> {
+    fn map<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
         let open = self.pos;
         self.advance()?; // skip {
         self.wsc()?;
-        let pairs = self.pairs(Some('}'))?;
+        handler.map_start()?;
+        self.pairs(Some('}'), handler)?;
         self.wsc()?;
         if self.peek()? == Some('}') {
             self.advance()?;
-            Ok(Value::Map(pairs))
+            handler.map_end()?;
+            Ok(())
         } else {
-            Err(Error::at("unclosed '{'", open))
+            Err(Error::at("unclosed '{'", open).into())
         }
     }
 
     // items = value { _ [ ';' ] _ value }
-    fn items(&mut self) -> Result<Vec<Value>, Error> {
-        let mut items = Vec::new();
-
+    fn items<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
         loop {
             if self.at_end()? || self.peek()? == Some(']') {
                 break;
             }
 
-            match self.value()? {
-                Some(v) => items.push(v),
-                None => {
-                    if !self.at_end()? && self.peek()? != Some(']') {
-                        let c = self.peek()?.unwrap();
-                        return Err(self.err(&format!("unexpected '{}'", c)));
-                    }
-                    break;
+            if !self.value(handler)? {
+                if !self.at_end()? && self.peek()? != Some(']') {
+                    let c = self.peek()?.unwrap();
+                    return Err(self.err(&format!("unexpected '{}'", c)).into());
                 }
+                break;
             }
 
             if self.at_end()? || self.peek()? == Some(']') {
@@ -430,21 +569,23 @@ impl<R: Read> Parser<R> {
             self.wsc()?;
         }
 
-        Ok(items)
+        Ok(())
     }
 
     // list = '[' _ [ items ] _ ']'
-    fn list(&mut self) -> Result<Value, Error> {
+    fn list<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
         let open = self.pos;
         self.advance()?; // skip [
         self.wsc()?;
-        let items = self.items()?;
+        handler.list_start()?;
+        self.items(handler)?;
         self.wsc()?;
         if self.peek()? == Some(']') {
             self.advance()?;
-            Ok(Value::List(items))
+            handler.list_end()?;
+            Ok(())
         } else {
-            Err(Error::at("unclosed '['", open))
+            Err(Error::at("unclosed '['", open).into())
         }
     }
 }

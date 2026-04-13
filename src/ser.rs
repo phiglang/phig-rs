@@ -1,19 +1,16 @@
-use std::io;
-
 use serde::ser::{self, Serialize};
 
 use crate::error::Error;
+use crate::fmt::Formatter;
 use crate::Value;
 
 /// Serialize a `T` to a phig writer.
 ///
 /// The value must serialize as a map (struct, `HashMap`, etc.).
-pub fn to_writer<T: Serialize>(value: &T, mut writer: impl io::Write) -> Result<(), Error> {
+pub fn to_writer<T: Serialize>(value: &T, writer: impl std::io::Write) -> Result<(), Error> {
     let val = to_value(value)?;
-    let Value::Map(pairs) = val else {
-        unreachable!("to_value enforces top-level map");
-    };
-    format_map(&pairs, 0, true, &mut writer)
+    let mut fmt = Formatter::new(writer);
+    fmt.write_value(&val)
 }
 
 /// Serialize a `T` to a phig string.
@@ -44,121 +41,6 @@ pub fn to_value<T: Serialize>(value: &T) -> Result<Value, Error> {
         return Err(Error::new("top-level value must be a map"));
     }
     Ok(val)
-}
-
-fn format_value(v: &Value, indent: usize, w: &mut dyn io::Write) -> Result<(), Error> {
-    match v {
-        Value::String(s) => format_string(s, w),
-        Value::List(items) => format_list(items, indent, w),
-        Value::Map(pairs) => format_map(pairs, indent, false, w),
-    }
-}
-
-fn format_string(s: &str, w: &mut dyn io::Write) -> Result<(), Error> {
-    if can_be_bare(s) {
-        w.write_all(s.as_bytes())?;
-    } else {
-        w.write_all(b"\"")?;
-        for c in s.chars() {
-            match c {
-                '"' => w.write_all(b"\\\"")?,
-                '\\' => w.write_all(b"\\\\")?,
-                '\n' => w.write_all(b"\\n")?,
-                '\r' => w.write_all(b"\\r")?,
-                '\t' => w.write_all(b"\\t")?,
-                '\0' => w.write_all(b"\\0")?,
-                c if c.is_control() => write!(w, "\\u{{{:x}}}", c as u32)?,
-                c => {
-                    let mut buf = [0u8; 4];
-                    w.write_all(c.encode_utf8(&mut buf).as_bytes())?;
-                }
-            }
-        }
-        w.write_all(b"\"")?;
-    }
-    Ok(())
-}
-
-fn can_be_bare(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| {
-            !c.is_whitespace() && !matches!(c, '{' | '}' | '[' | ']' | '"' | '#' | '\'' | ';')
-        })
-}
-
-fn write_indent(w: &mut dyn io::Write, level: usize) -> Result<(), Error> {
-    for _ in 0..level {
-        w.write_all(b"  ")?;
-    }
-    Ok(())
-}
-
-fn format_list(items: &[Value], indent: usize, w: &mut dyn io::Write) -> Result<(), Error> {
-    if items.is_empty() {
-        w.write_all(b"[]")?;
-        return Ok(());
-    }
-
-    let has_compound = items
-        .iter()
-        .any(|v| matches!(v, Value::Map(_) | Value::List(_)));
-
-    if has_compound {
-        let inner = indent + 1;
-        w.write_all(b"[\n")?;
-        for item in items {
-            write_indent(w, inner)?;
-            format_value(item, inner, w)?;
-            w.write_all(b"\n")?;
-        }
-        write_indent(w, indent)?;
-        w.write_all(b"]")?;
-    } else {
-        w.write_all(b"[")?;
-        for (i, item) in items.iter().enumerate() {
-            if i > 0 {
-                w.write_all(b" ")?;
-            }
-            format_value(item, indent, w)?;
-        }
-        w.write_all(b"]")?;
-    }
-    Ok(())
-}
-
-fn format_map(
-    pairs: &[(String, Value)],
-    indent: usize,
-    top_level: bool,
-    w: &mut dyn io::Write,
-) -> Result<(), Error> {
-    if pairs.is_empty() {
-        if !top_level {
-            w.write_all(b"{}")?;
-        }
-        return Ok(());
-    }
-
-    let inner = if top_level { indent } else { indent + 1 };
-
-    if !top_level {
-        w.write_all(b"{\n")?;
-    }
-
-    for (k, v) in pairs {
-        write_indent(w, inner)?;
-        format_string(k, w)?;
-        w.write_all(b" ")?;
-        format_value(v, inner, w)?;
-        w.write_all(b"\n")?;
-    }
-
-    if !top_level {
-        write_indent(w, indent)?;
-        w.write_all(b"}")?;
-    }
-
-    Ok(())
 }
 
 struct ValueSerializer;

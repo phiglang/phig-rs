@@ -1,13 +1,23 @@
 //! Parser and serializer for the [phig](https://phiglang.github.io) configuration language.
 //!
-//! Phig has three types: strings, lists, and maps. Type coercion (to numbers,
-//! booleans, etc.) is handled automatically via serde.
+//! Phig has three types: strings, lists, and maps. When the `serde` feature is
+//! enabled (default), type coercion to numbers, booleans, etc. is handled
+//! automatically.
 //!
 //! # Examples
 //!
-//! Deserialize into a struct:
+//! Work with untyped values:
 //!
 //! ```
+//! let val: phig::Value = "name foo\ntags [a b c]".parse().unwrap();
+//! assert_eq!(val["name"].as_str(), Some("foo"));
+//! assert_eq!(val["tags"][0].as_str(), Some("a"));
+//! ```
+//!
+//! Deserialize into a struct (requires `serde` feature):
+//!
+//! ```
+//! # #[cfg(feature = "serde")] {
 //! use serde::Deserialize;
 //!
 //! #[derive(Deserialize)]
@@ -20,26 +30,22 @@
 //! let cfg: Config = phig::from_str("name app\nport 8080\ntags [web prod]").unwrap();
 //! assert_eq!(cfg.name, "app");
 //! assert_eq!(cfg.port, 8080);
-//! ```
-//!
-//! Work with untyped values:
-//!
-//! ```
-//! let val: phig::Value = "name foo\ntags [a b c]".parse().unwrap();
-//! assert_eq!(val["name"].as_str(), Some("foo"));
-//! assert_eq!(val["tags"][0].as_str(), Some("a"));
+//! # }
 //! ```
 
+#[cfg(feature = "serde")]
 mod de;
 mod error;
-mod parse;
+pub mod fmt;
+pub mod parse;
+#[cfg(feature = "serde")]
 mod ser;
 
+#[cfg(feature = "serde")]
 pub use de::{from_reader, from_str, from_value};
 pub use error::Error;
+#[cfg(feature = "serde")]
 pub use ser::{to_string, to_value, to_writer};
-
-use std::fmt;
 
 /// A dynamically-typed phig value.
 ///
@@ -105,6 +111,7 @@ impl std::str::FromStr for Value {
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::Serialize for Value {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::{SerializeMap, SerializeSeq};
@@ -128,18 +135,21 @@ impl serde::Serialize for Value {
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for Value {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(ValueVisitor)
     }
 }
 
+#[cfg(feature = "serde")]
 struct ValueVisitor;
 
+#[cfg(feature = "serde")]
 impl<'de> serde::de::Visitor<'de> for ValueVisitor {
     type Value = Value;
 
-    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str("a phig value")
     }
 
@@ -204,7 +214,7 @@ impl std::ops::Index<usize> for Value {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "serde"))]
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
