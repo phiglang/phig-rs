@@ -133,6 +133,7 @@ impl Handler for ValueBuilder {
 /// Parse phig input and send events to a [`Handler`].
 pub fn parse_events<H: Handler>(reader: impl Read, handler: &mut H) -> Result<(), H::Error> {
     let mut p = Parser::new(reader);
+    p.skip_bom()?;
     p.wsc()?;
     handler.map_start()?;
     p.pairs(None, handler)?;
@@ -218,6 +219,15 @@ impl<R: Read> Parser<R> {
 
     fn err(&self, msg: &str) -> Error {
         Error::at(msg, self.pos)
+    }
+
+    /// Skip an optional UTF-8 BOM (EF BB BF) at the start of input.
+    fn skip_bom(&mut self) -> Result<(), Error> {
+        if self.fill(3)? >= 3 && self.buf[..3] == [0xEF, 0xBB, 0xBF] {
+            self.buf.drain(..3);
+            self.pos += 3;
+        }
+        Ok(())
     }
 
     // HSPACE = /[ \t]+/
