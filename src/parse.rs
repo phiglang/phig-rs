@@ -721,13 +721,13 @@ mod tests {
     #[test]
     fn duplicate_key_toplevel() {
         let e = parse("a 1\na 2".as_bytes()).unwrap_err();
-        assert!(e.msg.contains("duplicate key 'a'"), "{}", e.msg);
+        assert!(e.msg().unwrap().contains("duplicate key 'a'"), "{}", e);
     }
 
     #[test]
     fn duplicate_key_nested() {
         let e = parse("x { k 1; k 2 }".as_bytes()).unwrap_err();
-        assert!(e.msg.contains("duplicate key 'k'"), "{}", e.msg);
+        assert!(e.msg().unwrap().contains("duplicate key 'k'"), "{}", e);
     }
 
     #[test]
