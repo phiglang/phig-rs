@@ -3,12 +3,11 @@
 use std::io::Read;
 
 use crate::error::Error;
-use crate::Value;
 
 /// Handler for phig parser events.
 ///
-/// Implement this trait to receive events from [`parse_events`] without
-/// constructing an intermediate [`Value`] tree.
+/// Implement this trait to receive events from [`parse`] without constructing
+/// an intermediate [`crate::Value`] tree.
 pub trait Handler {
     /// The error type returned by handler methods.
     type Error: From<Error>;
@@ -27,111 +26,8 @@ pub trait Handler {
     fn string(&mut self, value: String) -> Result<(), Self::Error>;
 }
 
-struct ValueBuilder {
-    stack: Vec<BuildFrame>,
-    result: Option<Value>,
-}
-
-enum BuildFrame {
-    Map {
-        pairs: Vec<(String, Value)>,
-        pending_key: Option<String>,
-    },
-    List {
-        items: Vec<Value>,
-    },
-}
-
-impl ValueBuilder {
-    /// Create a new builder.
-    pub fn new() -> Self {
-        ValueBuilder {
-            stack: Vec::new(),
-            result: None,
-        }
-    }
-
-    /// Consume the builder and return the parsed value.
-    pub fn finish(self) -> Value {
-        self.result.expect("no value produced")
-    }
-
-    fn push_value(&mut self, value: Value) {
-        match self.stack.last_mut() {
-            Some(BuildFrame::Map { pairs, pending_key }) => {
-                let key = pending_key.take().expect("map value without key");
-                pairs.push((key, value));
-            }
-            Some(BuildFrame::List { items }) => {
-                items.push(value);
-            }
-            None => {
-                self.result = Some(value);
-            }
-        }
-    }
-}
-
-impl Default for ValueBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Handler for ValueBuilder {
-    type Error = Error;
-
-    fn map_start(&mut self) -> Result<(), Error> {
-        self.stack.push(BuildFrame::Map {
-            pairs: Vec::new(),
-            pending_key: None,
-        });
-        Ok(())
-    }
-
-    fn map_end(&mut self) -> Result<(), Error> {
-        let frame = self.stack.pop().expect("unbalanced map_end");
-        let value = match frame {
-            BuildFrame::Map { pairs, .. } => Value::Map(pairs),
-            _ => panic!("map_end on non-map frame"),
-        };
-        self.push_value(value);
-        Ok(())
-    }
-
-    fn list_start(&mut self) -> Result<(), Error> {
-        self.stack.push(BuildFrame::List { items: Vec::new() });
-        Ok(())
-    }
-
-    fn list_end(&mut self) -> Result<(), Error> {
-        let frame = self.stack.pop().expect("unbalanced list_end");
-        let value = match frame {
-            BuildFrame::List { items } => Value::List(items),
-            _ => panic!("list_end on non-list frame"),
-        };
-        self.push_value(value);
-        Ok(())
-    }
-
-    fn key(&mut self, key: String) -> Result<(), Error> {
-        match self.stack.last_mut() {
-            Some(BuildFrame::Map { pending_key, .. }) => {
-                *pending_key = Some(key);
-            }
-            _ => panic!("key outside of map"),
-        }
-        Ok(())
-    }
-
-    fn string(&mut self, value: String) -> Result<(), Error> {
-        self.push_value(Value::String(value));
-        Ok(())
-    }
-}
-
 /// Parse phig input and send events to a [`Handler`].
-pub fn parse_events<H: Handler>(reader: impl Read, handler: &mut H) -> Result<(), H::Error> {
+pub fn parse<H: Handler>(reader: impl Read, handler: &mut H) -> Result<(), H::Error> {
     let mut p = Parser::new(reader);
     p.skip_bom()?;
     p.wsc()?;
@@ -144,13 +40,6 @@ pub fn parse_events<H: Handler>(reader: impl Read, handler: &mut H) -> Result<()
         return Err(p.err(&format!("unexpected '{}'", c)).into());
     }
     Ok(())
-}
-
-/// Parse phig input into a [`Value`] tree.
-pub(crate) fn parse(reader: impl Read) -> Result<Value, Error> {
-    let mut builder = ValueBuilder::new();
-    parse_events(reader, &mut builder)?;
-    Ok(builder.finish())
 }
 
 struct Parser<R: Read> {
@@ -603,6 +492,13 @@ impl<R: Read> Parser<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
+
+    fn p(input: &[u8]) -> Result<Value, Error> {
+        let mut builder = crate::ValueBuilder::new();
+        parse(input, &mut builder)?;
+        Ok(builder.finish())
+    }
 
     fn s(v: &str) -> Value {
         Value::String(v.to_string())
@@ -610,13 +506,13 @@ mod tests {
 
     #[test]
     fn bare_pairs() {
-        let v = parse("name foo".as_bytes()).unwrap();
+        let v = p("name foo".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("name".into(), s("foo"))]));
     }
 
     #[test]
     fn multiple_pairs() {
-        let v = parse("a 1\nb 2".as_bytes()).unwrap();
+        let v = p("a 1\nb 2".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![("a".into(), s("1")), ("b".into(), s("2"))])
@@ -625,7 +521,7 @@ mod tests {
 
     #[test]
     fn semicolon_sep() {
-        let v = parse("a 1; b 2".as_bytes()).unwrap();
+        let v = p("a 1; b 2".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![("a".into(), s("1")), ("b".into(), s("2"))])
@@ -634,7 +530,7 @@ mod tests {
 
     #[test]
     fn nested_map() {
-        let v = parse("x { a 1; b 2 }".as_bytes()).unwrap();
+        let v = p("x { a 1; b 2 }".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![(
@@ -646,7 +542,7 @@ mod tests {
 
     #[test]
     fn list() {
-        let v = parse("tags [a b c]".as_bytes()).unwrap();
+        let v = p("tags [a b c]".as_bytes()).unwrap();
         assert_eq!(
             v,
             Value::Map(vec![(
@@ -658,102 +554,102 @@ mod tests {
 
     #[test]
     fn quoted_string() {
-        let v = parse(r#"msg "hello\nworld""#.as_bytes()).unwrap();
+        let v = p(r#"msg "hello\nworld""#.as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("msg".into(), s("hello\nworld"))]));
     }
 
     #[test]
     fn raw_string() {
-        let v = parse(r"path 'C:\foo\bar'".as_bytes()).unwrap();
+        let v = p(r"path 'C:\foo\bar'".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("path".into(), s(r"C:\foo\bar"))]));
     }
 
     #[test]
     fn unicode_escape() {
-        let v = parse(r#"ch "\u{1f331}""#.as_bytes()).unwrap();
+        let v = p(r#"ch "\u{1f331}""#.as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("ch".into(), s("\u{1f331}"))]))
     }
 
     #[test]
     fn comment() {
-        let v = parse("# header\na 1 # inline\n".as_bytes()).unwrap();
+        let v = p("# header\na 1 # inline\n".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("a".into(), s("1"))]));
     }
 
     #[test]
     fn line_continuation() {
-        let v = parse("msg \"hello \\\nworld\"".as_bytes()).unwrap();
+        let v = p("msg \"hello \\\nworld\"".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![("msg".into(), s("hello world"))]));
     }
 
     #[test]
     fn empty() {
-        let v = parse("".as_bytes()).unwrap();
+        let v = p("".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![]));
     }
 
     #[test]
     fn whitespace_only() {
-        let v = parse("  \n\n  ".as_bytes()).unwrap();
+        let v = p("  \n\n  ".as_bytes()).unwrap();
         assert_eq!(v, Value::Map(vec![]));
     }
 
     #[test]
     fn unclosed_brace() {
-        assert!(parse("x {".as_bytes()).is_err());
+        assert!(p("x {".as_bytes()).is_err());
     }
 
     #[test]
     fn unclosed_bracket() {
-        assert!(parse("x [".as_bytes()).is_err());
+        assert!(p("x [".as_bytes()).is_err());
     }
 
     #[test]
     fn unterminated_string() {
-        assert!(parse(r#"x "hello"#.as_bytes()).is_err());
+        assert!(p(r#"x "hello"#.as_bytes()).is_err());
     }
 
     #[test]
     fn invalid_escape() {
-        assert!(parse(r#"x "\q""#.as_bytes()).is_err());
+        assert!(p(r#"x "\q""#.as_bytes()).is_err());
     }
 
     #[test]
     fn duplicate_key_toplevel() {
-        let e = parse("a 1\na 2".as_bytes()).unwrap_err();
+        let e = p("a 1\na 2".as_bytes()).unwrap_err();
         assert!(e.msg().unwrap().contains("duplicate key 'a'"), "{}", e);
     }
 
     #[test]
     fn duplicate_key_nested() {
-        let e = parse("x { k 1; k 2 }".as_bytes()).unwrap_err();
+        let e = p("x { k 1; k 2 }".as_bytes()).unwrap_err();
         assert!(e.msg().unwrap().contains("duplicate key 'k'"), "{}", e);
     }
 
     #[test]
     fn nbsp_not_separator() {
-        assert!(parse("name\u{00a0}foo".as_bytes()).is_err());
+        assert!(p("name\u{00a0}foo".as_bytes()).is_err());
     }
 
     #[test]
     fn nbsp_in_bare_value() {
-        assert!(parse("name foo\u{00a0}bar".as_bytes()).is_err());
+        assert!(p("name foo\u{00a0}bar".as_bytes()).is_err());
     }
 
     #[test]
     fn em_space_in_bare_value() {
-        assert!(parse("name foo\u{2003}bar".as_bytes()).is_err());
+        assert!(p("name foo\u{2003}bar".as_bytes()).is_err());
     }
 
     #[test]
     fn nbsp_in_quoted_ok() {
-        let v = parse("name \"foo\u{00a0}bar\"".as_bytes()).unwrap();
+        let v = p("name \"foo\u{00a0}bar\"".as_bytes()).unwrap();
         assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
     }
 
     #[test]
     fn nbsp_in_raw_ok() {
-        let v = parse("name 'foo\u{00a0}bar'".as_bytes()).unwrap();
+        let v = p("name 'foo\u{00a0}bar'".as_bytes()).unwrap();
         assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
     }
 }

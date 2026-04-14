@@ -1,8 +1,30 @@
-use serde::ser::{self, Serialize};
+use serde::ser::{self, Serialize, SerializeMap, SerializeSeq};
 
 use crate::error::Error;
 use crate::fmt::Formatter;
 use crate::Value;
+
+impl Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Value::String(s) => serializer.serialize_str(s),
+            Value::List(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            Value::Map(pairs) => {
+                let mut map = serializer.serialize_map(Some(pairs.len()))?;
+                for (k, v) in pairs {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
 
 /// Serialize a `T` to a phig writer.
 ///

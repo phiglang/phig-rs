@@ -3,12 +3,70 @@ use std::io::Read;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 
 use crate::error::Error;
-use crate::parse;
+use crate::{parse, ValueBuilder};
 use crate::Value;
+
+impl<'de> serde::Deserialize<'de> for Value {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a phig value")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Value, E> {
+        Ok(Value::String(v))
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
+        Ok(Value::String(v.to_string()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(v) = seq.next_element()? {
+            items.push(v);
+        }
+        Ok(Value::List(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut pairs = Vec::new();
+        while let Some((k, v)) = map.next_entry()? {
+            pairs.push((k, v));
+        }
+        Ok(Value::Map(pairs))
+    }
+}
 
 /// Deserialize a `T` from a phig reader.
 pub fn from_reader<T: serde::de::DeserializeOwned>(reader: impl Read) -> Result<T, Error> {
-    from_value(parse::parse(reader)?)
+    let mut builder = ValueBuilder::new();
+    parse::parse(reader, &mut builder)?;
+    from_value(builder.finish())
 }
 
 /// Deserialize a `T` from a phig string.

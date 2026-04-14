@@ -107,90 +107,104 @@ impl std::str::FromStr for Value {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        parse::parse(s.as_bytes())
+        let mut builder = ValueBuilder::new();
+        parse::parse(s.as_bytes(), &mut builder)?;
+        Ok(builder.finish())
     }
 }
 
-#[cfg(feature = "serde")]
-impl serde::Serialize for Value {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{SerializeMap, SerializeSeq};
-        match self {
-            Value::String(s) => serializer.serialize_str(s),
-            Value::List(items) => {
-                let mut seq = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
+struct ValueBuilder {
+    stack: Vec<BuildFrame>,
+    result: Option<Value>,
+}
+
+enum BuildFrame {
+    Map {
+        pairs: Vec<(String, Value)>,
+        pending_key: Option<String>,
+    },
+    List {
+        items: Vec<Value>,
+    },
+}
+
+impl ValueBuilder {
+    fn new() -> Self {
+        ValueBuilder {
+            stack: Vec::new(),
+            result: None,
+        }
+    }
+
+    fn finish(self) -> Value {
+        self.result.expect("no value produced")
+    }
+
+    fn push_value(&mut self, value: Value) {
+        match self.stack.last_mut() {
+            Some(BuildFrame::Map { pairs, pending_key }) => {
+                let key = pending_key.take().expect("map value without key");
+                pairs.push((key, value));
             }
-            Value::Map(pairs) => {
-                let mut map = serializer.serialize_map(Some(pairs.len()))?;
-                for (k, v) in pairs {
-                    map.serialize_entry(k, v)?;
-                }
-                map.end()
+            Some(BuildFrame::List { items }) => {
+                items.push(value);
+            }
+            None => {
+                self.result = Some(value);
             }
         }
     }
 }
 
-#[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Value {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ValueVisitor)
-    }
-}
+impl parse::Handler for ValueBuilder {
+    type Error = Error;
 
-#[cfg(feature = "serde")]
-struct ValueVisitor;
-
-#[cfg(feature = "serde")]
-impl<'de> serde::de::Visitor<'de> for ValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a phig value")
+    fn map_start(&mut self) -> Result<(), Error> {
+        self.stack.push(BuildFrame::Map {
+            pairs: Vec::new(),
+            pending_key: None,
+        });
+        Ok(())
     }
 
-    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
+    fn map_end(&mut self) -> Result<(), Error> {
+        let frame = self.stack.pop().expect("unbalanced map_end");
+        let value = match frame {
+            BuildFrame::Map { pairs, .. } => Value::Map(pairs),
+            _ => panic!("map_end on non-map frame"),
+        };
+        self.push_value(value);
+        Ok(())
     }
 
-    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
+    fn list_start(&mut self) -> Result<(), Error> {
+        self.stack.push(BuildFrame::List { items: Vec::new() });
+        Ok(())
     }
 
-    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
+    fn list_end(&mut self) -> Result<(), Error> {
+        let frame = self.stack.pop().expect("unbalanced list_end");
+        let value = match frame {
+            BuildFrame::List { items } => Value::List(items),
+            _ => panic!("list_end on non-list frame"),
+        };
+        self.push_value(value);
+        Ok(())
     }
 
-    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(v) = seq.next_element()? {
-            items.push(v);
+    fn key(&mut self, key: String) -> Result<(), Error> {
+        match self.stack.last_mut() {
+            Some(BuildFrame::Map { pending_key, .. }) => {
+                *pending_key = Some(key);
+            }
+            _ => panic!("key outside of map"),
         }
-        Ok(Value::List(items))
+        Ok(())
     }
 
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut pairs = Vec::new();
-        while let Some((k, v)) = map.next_entry()? {
-            pairs.push((k, v));
-        }
-        Ok(Value::Map(pairs))
+    fn string(&mut self, value: String) -> Result<(), Error> {
+        self.push_value(Value::String(value));
+        Ok(())
     }
 }
 
