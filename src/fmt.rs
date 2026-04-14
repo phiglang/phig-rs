@@ -48,7 +48,7 @@ fn list_buf_push(stack: &mut Vec<ListBuildFrame>, value: Value) {
 }
 
 impl<W> Formatter<W> {
-    /// Create a new formatter writing to the given writer.
+    /// Create a new formatter that writes to `writer`.
     pub fn new(writer: W) -> Self {
         Formatter {
             writer,
@@ -90,6 +90,8 @@ impl<W: io::Write> Formatter<W> {
         Ok(())
     }
 
+    /// Begin a map. Call [`key`](Self::key) and a value method for each entry,
+    /// then [`map_end`](Self::map_end) to close.
     pub fn map_start(&mut self) -> Result<(), Error> {
         if let Some(FormatFrame::List { nesting, stack, .. }) = self.stack.last_mut() {
             *nesting += 1;
@@ -116,6 +118,7 @@ impl<W: io::Write> Formatter<W> {
         Ok(())
     }
 
+    /// End the current map.
     pub fn map_end(&mut self) -> Result<(), Error> {
         if let Some(FormatFrame::List { nesting, stack, .. }) = self.stack.last_mut() {
             assert!(*nesting > 0, "unbalanced map_end inside list");
@@ -150,6 +153,8 @@ impl<W: io::Write> Formatter<W> {
         self.value_written()
     }
 
+    /// Begin a list. Call value methods for each element, then
+    /// [`list_end`](Self::list_end) to close.
     pub fn list_start(&mut self) -> Result<(), Error> {
         if let Some(FormatFrame::List { nesting, stack, .. }) = self.stack.last_mut() {
             *nesting += 1;
@@ -171,6 +176,7 @@ impl<W: io::Write> Formatter<W> {
         Ok(())
     }
 
+    /// End the current list.
     pub fn list_end(&mut self) -> Result<(), Error> {
         if let Some(FormatFrame::List { nesting, stack, .. }) = self.stack.last_mut() {
             if *nesting > 0 {
@@ -198,6 +204,7 @@ impl<W: io::Write> Formatter<W> {
         self.value_written()
     }
 
+    /// Emit a map key. Must be followed by exactly one value method call.
     pub fn key(&mut self, k: String) -> Result<(), Error> {
         if let Some(FormatFrame::List { stack, .. }) = self.stack.last_mut() {
             let ListBuildFrame::Map(_, key) = stack.last_mut().unwrap() else {
@@ -235,6 +242,7 @@ impl<W: io::Write> Formatter<W> {
         Ok(())
     }
 
+    /// Emit a string value.
     pub fn string(&mut self, value: String) -> Result<(), Error> {
         if let Some(FormatFrame::List { stack, .. }) = self.stack.last_mut() {
             list_buf_push(stack, Value::String(value));
