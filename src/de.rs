@@ -1,72 +1,14 @@
 use std::io::Read;
 
-use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::error::Error;
-use crate::{parse, ValueBuilder};
-use crate::Value;
-
-impl<'de> serde::Deserialize<'de> for Value {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ValueVisitor)
-    }
-}
-
-struct ValueVisitor;
-
-impl<'de> Visitor<'de> for ValueVisitor {
-    type Value = Value;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a phig value")
-    }
-
-    fn visit_str<E: de::Error>(self, v: &str) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_string<E: de::Error>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
-    }
-
-    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Value, E> {
-        Ok(Value::String(v.to_string()))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-        let mut items = Vec::new();
-        while let Some(v) = seq.next_element()? {
-            items.push(v);
-        }
-        Ok(Value::List(items))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-        let mut pairs = Vec::new();
-        while let Some((k, v)) = map.next_entry()? {
-            pairs.push((k, v));
-        }
-        Ok(Value::Map(pairs))
-    }
-}
+use crate::parse::{Event, PhigParser};
 
 /// Deserialize a `T` from a phig reader.
 pub fn from_reader<T: serde::de::DeserializeOwned>(reader: impl Read) -> Result<T, Error> {
-    let mut builder = ValueBuilder::new();
-    parse::parse(reader, &mut builder)?;
-    from_value(builder.finish())
+    let mut de = StreamDeserializer::new(reader);
+    T::deserialize(&mut de)
 }
 
 /// Deserialize a `T` from a phig string.
@@ -84,42 +26,89 @@ pub fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Error> {
     from_reader(s.as_bytes())
 }
 
-/// Deserialize a `T` from a [`Value`].
-pub fn from_value<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, Error> {
-    if !matches!(value, Value::Map(_)) {
-        return Err(Error::new("top-level value must be a map"));
+struct StreamDeserializer<R: Read> {
+    parser: PhigParser<R>,
+    peeked: Option<Event>,
+}
+
+impl<R: Read> StreamDeserializer<R> {
+    fn new(reader: R) -> Self {
+        StreamDeserializer {
+            parser: PhigParser::new(reader),
+            peeked: None,
+        }
     }
-    T::deserialize(Deserializer { value })
+
+    fn peek_event(&mut self) -> Result<Option<&Event>, Error> {
+        if self.peeked.is_none() {
+            self.peeked = self.parser.next().transpose()?;
+        }
+        Ok(self.peeked.as_ref())
+    }
+
+    fn take_event(&mut self) -> Result<Event, Error> {
+        match self.peeked.take() {
+            Some(event) => Ok(event),
+            None => self
+                .parser
+                .next()
+                .transpose()?
+                .ok_or_else(|| Error::new("unexpected end of input")),
+        }
+    }
+
+    fn take_string(&mut self) -> Result<String, Error> {
+        match self.take_event()? {
+            Event::String(s) => Ok(s),
+            _ => Err(Error::new("expected string")),
+        }
+    }
+
+    fn parse_number<T: std::str::FromStr>(&mut self) -> Result<T, Error>
+    where
+        T::Err: std::fmt::Display,
+    {
+        let s = self.take_string()?;
+        s.parse()
+            .map_err(|e: T::Err| Error::new(format!("invalid number '{}': {}", s, e)))
+    }
+
+    fn skip_value(&mut self) -> Result<(), Error> {
+        match self.take_event()? {
+            Event::String(_) => Ok(()),
+            Event::StartMap | Event::StartList => {
+                let mut depth = 1u32;
+                while depth > 0 {
+                    match self.take_event()? {
+                        Event::StartMap | Event::StartList => depth += 1,
+                        Event::EndMap | Event::EndList => depth -= 1,
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::new("unexpected event")),
+        }
+    }
 }
 
-struct Deserializer {
-    value: Value,
-}
-
-impl<'de> de::Deserializer<'de> for Deserializer {
+impl<'de, 'a, R: Read> de::Deserializer<'de> for &'a mut StreamDeserializer<R> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::String(s) => visitor.visit_string(s),
-            Value::List(items) => visitor.visit_seq(SeqAccessor {
-                iter: items.into_iter(),
-            }),
-            Value::Map(pairs) => visitor.visit_map(MapAccessor {
-                iter: pairs.into_iter(),
-                value: None,
-            }),
+        match self.take_event()? {
+            Event::String(s) => visitor.visit_string(s),
+            Event::StartMap => visitor.visit_map(StreamMapAccess { de: self }),
+            Event::StartList => visitor.visit_seq(StreamSeqAccess { de: self }),
+            _ => Err(Error::new("unexpected event")),
         }
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::String(ref s) => match s.as_str() {
-                "true" => visitor.visit_bool(true),
-                "false" => visitor.visit_bool(false),
-                _ => Err(Error::new(format!("expected bool, got '{}'", s))),
-            },
-            _ => Err(Error::new("expected string for bool")),
+        match self.take_string()?.as_str() {
+            "true" => visitor.visit_bool(true),
+            "false" => visitor.visit_bool(false),
+            s => Err(Error::new(format!("expected bool, got '{}'", s))),
         }
     }
 
@@ -164,15 +153,11 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     }
 
     fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::String(s) => {
-                let mut chars = s.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(c), None) => visitor.visit_char(c),
-                    _ => Err(Error::new("expected single character")),
-                }
-            }
-            _ => Err(Error::new("expected string for char")),
+        let s = self.take_string()?;
+        let mut chars = s.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => visitor.visit_char(c),
+            _ => Err(Error::new("expected single character")),
         }
     }
 
@@ -181,10 +166,7 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     }
 
     fn deserialize_string<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::String(s) => visitor.visit_string(s),
-            _ => Err(Error::new("expected string")),
-        }
+        visitor.visit_string(self.take_string()?)
     }
 
     fn deserialize_bytes<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -220,10 +202,8 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     }
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::List(items) => visitor.visit_seq(SeqAccessor {
-                iter: items.into_iter(),
-            }),
+        match self.take_event()? {
+            Event::StartList => visitor.visit_seq(StreamSeqAccess { de: self }),
             _ => Err(Error::new("expected list")),
         }
     }
@@ -246,11 +226,8 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     }
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Value::Map(pairs) => visitor.visit_map(MapAccessor {
-                iter: pairs.into_iter(),
-                value: None,
-            }),
+        match self.take_event()? {
+            Event::StartMap => visitor.visit_map(StreamMapAccess { de: self }),
             _ => Err(Error::new("expected map")),
         }
     }
@@ -270,20 +247,23 @@ impl<'de> de::Deserializer<'de> for Deserializer {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        match self.value {
-            Value::String(s) => visitor.visit_enum(EnumDeserializer {
-                variant: s,
-                value: None,
-            }),
-            Value::Map(mut pairs) => {
-                if pairs.len() != 1 {
-                    return Err(Error::new("expected single-entry map for enum"));
+        match self.peek_event()? {
+            Some(Event::String(_)) => {
+                let Event::String(s) = self.take_event()? else {
+                    unreachable!()
+                };
+                visitor.visit_enum(s.into_deserializer())
+            }
+            Some(Event::StartMap) => {
+                self.take_event()?; // consume StartMap
+                let Event::Key(variant) = self.take_event()? else {
+                    return Err(Error::new("expected variant name"));
+                };
+                let result = visitor.visit_enum(StreamEnumAccess { variant, de: self })?;
+                match self.take_event()? {
+                    Event::EndMap => Ok(result),
+                    _ => Err(Error::new("expected end of enum map")),
                 }
-                let (variant, value) = pairs.remove(0);
-                visitor.visit_enum(EnumDeserializer {
-                    variant,
-                    value: Some(value),
-                })
             }
             _ => Err(Error::new("expected string or map for enum")),
         }
@@ -294,118 +274,97 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.skip_value()?;
         visitor.visit_unit()
     }
 }
 
-impl Deserializer {
-    fn parse_number<T: std::str::FromStr>(&self) -> Result<T, Error>
-    where
-        T::Err: std::fmt::Display,
-    {
-        match &self.value {
-            Value::String(s) => s
-                .parse()
-                .map_err(|e: T::Err| Error::new(format!("invalid number '{}': {}", s, e))),
-            _ => Err(Error::new("expected string for number")),
-        }
-    }
+struct StreamMapAccess<'a, R: Read> {
+    de: &'a mut StreamDeserializer<R>,
 }
 
-struct SeqAccessor {
-    iter: std::vec::IntoIter<Value>,
-}
-
-impl<'de> SeqAccess<'de> for SeqAccessor {
-    type Error = Error;
-
-    fn next_element_seed<T: DeserializeSeed<'de>>(
-        &mut self,
-        seed: T,
-    ) -> Result<Option<T::Value>, Error> {
-        match self.iter.next() {
-            Some(v) => seed.deserialize(Deserializer { value: v }).map(Some),
-            None => Ok(None),
-        }
-    }
-}
-
-struct MapAccessor {
-    iter: std::vec::IntoIter<(String, Value)>,
-    value: Option<Value>,
-}
-
-impl<'de> MapAccess<'de> for MapAccessor {
+impl<'de, 'a, R: Read> MapAccess<'de> for StreamMapAccess<'a, R> {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, Error> {
-        match self.iter.next() {
-            Some((key, value)) => {
-                self.value = Some(value);
-                seed.deserialize(Deserializer {
-                    value: Value::String(key),
-                })
+        match self.de.take_event()? {
+            Event::Key(k) => seed
+                .deserialize(k.into_deserializer())
                 .map(Some)
-            }
-            None => Ok(None),
+                .map_err(Error::from_serde::<serde::de::value::Error>),
+            Event::EndMap => Ok(None),
+            _ => Err(Error::new("expected key or end of map")),
         }
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let value = self
-            .value
-            .take()
-            .ok_or_else(|| Error::new("missing value"))?;
-        seed.deserialize(Deserializer { value })
+        seed.deserialize(&mut *self.de)
     }
 }
 
-struct EnumDeserializer {
-    variant: String,
-    value: Option<Value>,
+struct StreamSeqAccess<'a, R: Read> {
+    de: &'a mut StreamDeserializer<R>,
 }
 
-impl<'de> de::EnumAccess<'de> for EnumDeserializer {
+impl<'de, 'a, R: Read> SeqAccess<'de> for StreamSeqAccess<'a, R> {
     type Error = Error;
-    type Variant = VariantDeserializer;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, Error> {
+        match self.de.peek_event()? {
+            Some(Event::EndList) => {
+                self.de.take_event()?;
+                Ok(None)
+            }
+            Some(_) => seed.deserialize(&mut *self.de).map(Some),
+            None => Err(Error::new("unexpected end of input in list")),
+        }
+    }
+}
+
+struct StreamEnumAccess<'a, R: Read> {
+    variant: String,
+    de: &'a mut StreamDeserializer<R>,
+}
+
+impl<'de, 'a, R: Read> de::EnumAccess<'de> for StreamEnumAccess<'a, R> {
+    type Error = Error;
+    type Variant = StreamVariantAccess<'a, R>;
 
     fn variant_seed<V: DeserializeSeed<'de>>(
         self,
         seed: V,
     ) -> Result<(V::Value, Self::Variant), Error> {
-        let variant = seed.deserialize(Deserializer {
-            value: Value::String(self.variant),
-        })?;
-        Ok((variant, VariantDeserializer { value: self.value }))
+        let variant = seed
+            .deserialize(self.variant.into_deserializer())
+            .map_err(Error::from_serde::<serde::de::value::Error>)?;
+        Ok((variant, StreamVariantAccess { de: self.de }))
     }
 }
 
-struct VariantDeserializer {
-    value: Option<Value>,
+struct StreamVariantAccess<'a, R: Read> {
+    de: &'a mut StreamDeserializer<R>,
 }
 
-impl<'de> de::VariantAccess<'de> for VariantDeserializer {
+impl<'de, 'a, R: Read> de::VariantAccess<'de> for StreamVariantAccess<'a, R> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Error> {
+        self.de.skip_value()?;
         Ok(())
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
-        match self.value {
-            Some(v) => seed.deserialize(Deserializer { value: v }),
-            None => Err(Error::new("expected data for newtype variant")),
-        }
+        seed.deserialize(&mut *self.de)
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
-        match self.value {
-            Some(v) => de::Deserializer::deserialize_seq(Deserializer { value: v }, visitor),
-            None => Err(Error::new("expected data for tuple variant")),
-        }
+        de::Deserializer::deserialize_seq(&mut *self.de, visitor)
     }
 
     fn struct_variant<V: Visitor<'de>>(
@@ -413,10 +372,13 @@ impl<'de> de::VariantAccess<'de> for VariantDeserializer {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        match self.value {
-            Some(v) => de::Deserializer::deserialize_map(Deserializer { value: v }, visitor),
-            None => Err(Error::new("expected data for struct variant")),
-        }
+        de::Deserializer::deserialize_map(&mut *self.de, visitor)
+    }
+}
+
+impl Error {
+    fn from_serde<E: de::Error>(e: E) -> Self {
+        Error::new(format!("{}", e))
     }
 }
 
@@ -588,21 +550,6 @@ mod tests {
             Config {
                 level: Level::Debug
             }
-        );
-    }
-
-    #[test]
-    fn to_value() {
-        let v: Value = from_str("name foo\ntags [a b]").unwrap();
-        assert_eq!(
-            v,
-            Value::Map(vec![
-                ("name".into(), Value::String("foo".into())),
-                (
-                    "tags".into(),
-                    Value::List(vec![Value::String("a".into()), Value::String("b".into()),])
-                ),
-            ])
         );
     }
 }

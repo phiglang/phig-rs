@@ -1,61 +1,311 @@
-//! Event-driven parser for the phig format.
+//! Pull-based parser for the phig format.
 
+use std::collections::HashSet;
 use std::io::Read;
 
 use crate::error::Error;
 
-/// Handler for phig parser events.
+/// Events emitted by [`PhigParser`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    StartMap,
+    EndMap,
+    Key(String),
+    StartList,
+    EndList,
+    String(String),
+}
+
+/// Pull-based parser for the phig configuration language.
 ///
-/// Implement this trait to receive events from [`parse`] without constructing
-/// an intermediate [`crate::Value`] tree.
-pub trait Handler {
-    /// The error type returned by handler methods.
-    type Error: From<Error>;
-
-    /// Called when a map begins (`{` or the implicit top-level map).
-    fn map_start(&mut self) -> Result<(), Self::Error>;
-    /// Called when a map ends (`}` or the implicit top-level map).
-    fn map_end(&mut self) -> Result<(), Self::Error>;
-    /// Called when a list begins (`[`).
-    fn list_start(&mut self) -> Result<(), Self::Error>;
-    /// Called when a list ends (`]`).
-    fn list_end(&mut self) -> Result<(), Self::Error>;
-    /// Called for each key in a map, immediately before its value event.
-    fn key(&mut self, key: String) -> Result<(), Self::Error>;
-    /// Called for each string value.
-    fn string(&mut self, value: String) -> Result<(), Self::Error>;
-}
-
-/// Parse phig input and send events to a [`Handler`].
-pub fn parse<H: Handler>(reader: impl Read, handler: &mut H) -> Result<(), H::Error> {
-    let mut p = Parser::new(reader);
-    p.skip_bom()?;
-    p.wsc()?;
-    handler.map_start()?;
-    p.pairs(None, handler)?;
-    handler.map_end()?;
-    p.wsc()?;
-    if !p.at_end()? {
-        let c = p.peek()?.unwrap();
-        return Err(p.err(&format!("unexpected '{}'", c)).into());
-    }
-    Ok(())
-}
-
-struct Parser<R: Read> {
+/// Each call to [`next`](PhigParser::next) returns the next parse [`Event`],
+/// or `None` when the input is fully consumed.
+///
+/// Parser states correspond to positions in the grammar:
+/// ```text
+///   toplevel = [BOM] _ [pairs] _ EOF
+///   value    = map | list | string
+///   map      = '{' _ [pairs] _ '}'
+///   pairs    = pair { PAIRSEP _ pair }
+///   pair     = string [HSPACE] value [HSPACE] [COMMENT]
+///   list     = '[' _ [items] _ ']'
+///   items    = value { _ [';'] _ value }
+/// ```
+pub struct PhigParser<R: Read> {
     reader: R,
     buf: Vec<u8>,
     pos: usize,
+    state: State,
+    stack: Vec<Frame>,
 }
 
-impl<R: Read> Parser<R> {
-    fn new(reader: R) -> Self {
-        Parser {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    /// toplevel: before BOM / first pair.
+    DocStart,
+    /// pairs: expecting a key or end of container.
+    BeforePair,
+    /// pair: key parsed, expecting value.
+    AfterKey,
+    /// pairs: pair done, expecting PAIRSEP or end of container.
+    BetweenPairs,
+    /// items: expecting a value or ']'.
+    BeforeItem,
+    /// items: item done, expecting separator or ']'.
+    BetweenItems,
+    /// Document fully consumed.
+    Done,
+}
+
+struct Frame {
+    is_list: bool,
+    closing: Option<char>,
+    open_pos: usize,
+    seen: Option<HashSet<String>>,
+}
+
+impl<R: Read> PhigParser<R> {
+    /// Create a new parser that reads from `reader`.
+    pub fn new(reader: R) -> Self {
+        PhigParser {
             reader,
             buf: Vec::new(),
             pos: 0,
+            state: State::DocStart,
+            stack: Vec::new(),
         }
     }
+
+    fn next_event(&mut self) -> Result<Option<Event>, Error> {
+        loop {
+            match self.state {
+                // toplevel = [BOM] _ [pairs] _ EOF
+                State::DocStart => {
+                    self.skip_bom()?;
+                    self.wsc()?;
+                    self.stack.push(Frame {
+                        is_list: false,
+                        closing: None,
+                        open_pos: 0,
+                        seen: Some(HashSet::new()),
+                    });
+                    self.state = State::BeforePair;
+                    return Ok(Some(Event::StartMap));
+                }
+
+                // pairs = pair { PAIRSEP _ pair }
+                //         ^--- expecting a key (start of pair) or end of map
+                State::BeforePair => {
+                    if self.at_map_end()? {
+                        return self.close_map().map(Some);
+                    }
+                    return self.parse_key().map(Some);
+                }
+
+                // pair = string [HSPACE] value [HSPACE] [COMMENT]
+                //                        ^--- key parsed, expecting value
+                State::AfterKey => {
+                    return self.parse_value(State::BetweenPairs).map(Some);
+                }
+
+                // pairs = pair { PAIRSEP _ pair }
+                //              ^--- pair done, expecting PAIRSEP or end of map
+                State::BetweenPairs => {
+                    self.hspace()?; // [HSPACE] trailing the pair
+                    self.comment()?; // [COMMENT] trailing the pair
+                    if self.at_map_end()? {
+                        self.state = State::BeforePair;
+                        continue;
+                    }
+                    if !self.pairsep()? {
+                        return Err(self.err("expected newline or ';' after value"));
+                    }
+                    self.wsc()?; // _ before next pair
+                    self.state = State::BeforePair;
+                }
+
+                // items = value { _ [';'] _ value }
+                //         ^--- expecting a value or ']'
+                State::BeforeItem => {
+                    if self.at_list_end()? {
+                        return self.close_list().map(Some);
+                    }
+                    return self.parse_value(State::BetweenItems).map(Some);
+                }
+
+                // items = value { _ [';'] _ value }
+                //              ^--- item done, expecting separator or ']'
+                State::BetweenItems => {
+                    if self.at_end()? || self.peek()? == Some(']') {
+                        self.state = State::BeforeItem;
+                        continue;
+                    }
+                    self.wsc()?;
+                    if self.peek()? == Some(';') {
+                        self.advance()?;
+                    }
+                    self.wsc()?;
+                    self.state = State::BeforeItem;
+                }
+
+                State::Done => {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    // ── grammar-level helpers ──────────────────────────────────────
+
+    /// Parses a key at the start of a pair, checks for duplicates,
+    /// consumes trailing HSPACE, and returns [`Event::Key`].
+    fn parse_key(&mut self) -> Result<Event, Error> {
+        let start = self.pos;
+        let key = match self.string_val()? {
+            Some(k) => k,
+            None => {
+                let c = self.peek()?.unwrap();
+                return Err(Error::at(&format!("unexpected '{}'", c), self.pos));
+            }
+        };
+
+        {
+            let frame = self.stack.last_mut().unwrap();
+            let seen = frame.seen.as_mut().unwrap();
+            if seen.contains(&key) {
+                return Err(Error::at(&format!("duplicate key '{}'", key), start));
+            }
+            seen.insert(key.clone());
+        }
+
+        self.hspace()?; // [HSPACE] between key and value
+        self.state = State::AfterKey;
+        Ok(Event::Key(key))
+    }
+
+    /// Parses a value (map, list, or string) and returns the
+    /// corresponding event.
+    ///
+    /// `after_string` is the state to transition to when the value is a
+    /// plain string (for maps/lists the state is set to the
+    /// container-interior state instead).
+    fn parse_value(&mut self, after_string: State) -> Result<Event, Error> {
+        match self.peek()? {
+            Some('{') => {
+                let open = self.pos;
+                self.advance()?;
+                self.wsc()?;
+                self.stack.push(Frame {
+                    is_list: false,
+                    closing: Some('}'),
+                    open_pos: open,
+                    seen: Some(HashSet::new()),
+                });
+                self.state = State::BeforePair;
+                Ok(Event::StartMap)
+            }
+            Some('[') => {
+                let open = self.pos;
+                self.advance()?;
+                self.wsc()?;
+                self.stack.push(Frame {
+                    is_list: true,
+                    closing: Some(']'),
+                    open_pos: open,
+                    seen: None,
+                });
+                self.state = State::BeforeItem;
+                Ok(Event::StartList)
+            }
+            cp => {
+                let s = self.string_val()?;
+                match s {
+                    Some(s) => {
+                        self.state = after_string;
+                        Ok(Event::String(s))
+                    }
+                    None => {
+                        let msg = if after_string == State::BetweenPairs {
+                            "expected value after key".to_string()
+                        } else {
+                            format!("unexpected '{}'", cp.unwrap())
+                        };
+                        Err(Error::at(&msg, self.pos))
+                    }
+                }
+            }
+        }
+    }
+
+    /// True when the current position is at the end of the innermost map.
+    fn at_map_end(&mut self) -> Result<bool, Error> {
+        let closing = self.stack.last().unwrap().closing;
+        match closing {
+            None => self.at_end(),
+            Some(c) => Ok(self.at_end()? || self.peek()? == Some(c)),
+        }
+    }
+
+    /// True when the current position is at the end of the innermost list.
+    fn at_list_end(&mut self) -> Result<bool, Error> {
+        Ok(self.at_end()? || self.peek()? == Some(']'))
+    }
+
+    /// Closes the current map: consumes '}' (or verifies EOF for
+    /// top-level), pops the frame, and returns [`Event::EndMap`].
+    fn close_map(&mut self) -> Result<Event, Error> {
+        let closing = self.stack.last().unwrap().closing;
+        let open_pos = self.stack.last().unwrap().open_pos;
+
+        match closing {
+            Some(c) => {
+                if self.peek()? != Some(c) {
+                    return Err(Error::at("unclosed '{'", open_pos));
+                }
+                self.advance()?;
+            }
+            None => {
+                self.wsc()?;
+                if !self.at_end()? {
+                    let c = self.peek()?.unwrap();
+                    return Err(Error::at(&format!("unexpected '{}'", c), self.pos));
+                }
+            }
+        }
+
+        self.stack.pop();
+        self.after_container();
+        Ok(Event::EndMap)
+    }
+
+    /// Closes the current list: consumes ']', pops the frame,
+    /// and returns [`Event::EndList`].
+    fn close_list(&mut self) -> Result<Event, Error> {
+        let open_pos = self.stack.last().unwrap().open_pos;
+        if self.peek()? != Some(']') {
+            return Err(Error::at("unclosed '['", open_pos));
+        }
+        self.advance()?;
+        self.stack.pop();
+        self.after_container();
+        Ok(Event::EndList)
+    }
+
+    /// Sets the state appropriate for the parent context after closing a container.
+    fn after_container(&mut self) {
+        if self.stack.is_empty() {
+            self.state = State::Done;
+        } else {
+            let parent = self.stack.last().unwrap();
+            self.state = if parent.is_list {
+                State::BetweenItems
+            } else {
+                State::BetweenPairs
+            };
+        }
+    }
+
+    // ── low-level scanning ──────────────────────────────────────────
 
     /// Ensure at least `n` bytes in the lookahead buffer.
     fn fill(&mut self, n: usize) -> Result<usize, Error> {
@@ -119,7 +369,7 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
-    // HSPACE = /[ \t]+/
+    /// Consumes horizontal whitespace (space and tab only).
     fn hspace(&mut self) -> Result<bool, Error> {
         let start = self.pos;
         while matches!(self.peek()?, Some(' ' | '\t')) {
@@ -128,7 +378,7 @@ impl<R: Read> Parser<R> {
         Ok(self.pos > start)
     }
 
-    // PAIRSEP = /(\r?\n)+|;/
+    /// Consumes a pair separator: one or more newlines, or a semicolon.
     fn pairsep(&mut self) -> Result<bool, Error> {
         if self.peek()? == Some(';') {
             self.advance()?;
@@ -152,7 +402,7 @@ impl<R: Read> Parser<R> {
         Ok(self.pos > start)
     }
 
-    // COMMENT = '#' /[^\n]*/
+    /// Consumes a # comment to end of line.
     fn comment(&mut self) -> Result<bool, Error> {
         if self.peek()? == Some('#') {
             loop {
@@ -169,7 +419,7 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    // _ = { WS | COMMENT }
+    /// Consumes structural whitespace (space, tab, CR, LF) and comments.
     fn wsc(&mut self) -> Result<(), Error> {
         loop {
             match self.peek()? {
@@ -185,7 +435,7 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
-    // QSTRING = '"' { QCHAR } '"'
+    /// Parses a double-quoted string with escape sequences.
     fn qstring(&mut self) -> Result<String, Error> {
         let open = self.pos;
         self.advance()?; // skip "
@@ -297,7 +547,7 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    // QRSTRING = "'" /[^']*/ "'"
+    /// Parses a single-quoted raw string (no escapes).
     fn qrstring(&mut self) -> Result<String, Error> {
         let open = self.pos;
         self.advance()?; // skip '
@@ -314,7 +564,7 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    // BARE = /[^\p{White_Space}{}[\]"#';]+/
+    /// Parses a bare (unquoted) string. Returns `None` if no characters consumed.
     fn bare(&mut self) -> Result<Option<String>, Error> {
         let mut result = String::new();
         loop {
@@ -332,160 +582,21 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    // string = QSTRING | QRSTRING | BARE
-    fn string(&mut self) -> Result<Option<String>, Error> {
+    /// Parses a string value (quoted, raw, or bare). Returns `None` if none found.
+    fn string_val(&mut self) -> Result<Option<String>, Error> {
         match self.peek()? {
             Some('"') => self.qstring().map(Some),
             Some('\'') => self.qrstring().map(Some),
             _ => self.bare(),
         }
     }
+}
 
-    // value = map | list | string
-    fn value<H: Handler>(&mut self, handler: &mut H) -> Result<bool, H::Error> {
-        match self.peek()? {
-            Some('{') => {
-                self.map(handler)?;
-                Ok(true)
-            }
-            Some('[') => {
-                self.list(handler)?;
-                Ok(true)
-            }
-            _ => match self.string()? {
-                Some(s) => {
-                    handler.string(s)?;
-                    Ok(true)
-                }
-                None => Ok(false),
-            },
-        }
-    }
+impl<R: Read> Iterator for PhigParser<R> {
+    type Item = Result<Event, Error>;
 
-    // pair = string HSPACE value [ HSPACE ] [ COMMENT ]
-    fn pair<H: Handler>(
-        &mut self,
-        seen: &mut std::collections::HashSet<String>,
-        handler: &mut H,
-    ) -> Result<bool, H::Error> {
-        let start = self.pos;
-        let key = match self.string()? {
-            Some(k) => k,
-            None => return Ok(false),
-        };
-
-        if !seen.insert(key.clone()) {
-            return Err(Error::at(&format!("duplicate key '{}'", key), start).into());
-        }
-
-        self.hspace()?;
-        handler.key(key)?;
-
-        if !self.value(handler)? {
-            return Err(self.err("expected value after key").into());
-        }
-
-        self.hspace()?;
-        self.comment()?;
-
-        Ok(true)
-    }
-
-    // pairs = pair { PAIRSEP _ pair }
-    fn pairs<H: Handler>(
-        &mut self,
-        closing: Option<char>,
-        handler: &mut H,
-    ) -> Result<(), H::Error> {
-        let mut seen = std::collections::HashSet::new();
-
-        loop {
-            if self.at_end()? || self.peek()? == closing {
-                break;
-            }
-
-            if !self.pair(&mut seen, handler)? {
-                if !self.at_end()? && self.peek()? != closing {
-                    let c = self.peek()?.unwrap();
-                    return Err(self.err(&format!("unexpected '{}'", c)).into());
-                }
-                break;
-            }
-
-            if self.at_end()? || self.peek()? == closing {
-                break;
-            }
-
-            if !self.pairsep()? {
-                return Err(self.err("expected newline or ';' after value").into());
-            }
-            self.wsc()?;
-        }
-
-        Ok(())
-    }
-
-    // map = '{' _ [ pairs ] _ '}'
-    fn map<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
-        let open = self.pos;
-        self.advance()?; // skip {
-        self.wsc()?;
-        handler.map_start()?;
-        self.pairs(Some('}'), handler)?;
-        self.wsc()?;
-        if self.peek()? == Some('}') {
-            self.advance()?;
-            handler.map_end()?;
-            Ok(())
-        } else {
-            Err(Error::at("unclosed '{'", open).into())
-        }
-    }
-
-    // items = value { _ [ ';' ] _ value }
-    fn items<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
-        loop {
-            if self.at_end()? || self.peek()? == Some(']') {
-                break;
-            }
-
-            if !self.value(handler)? {
-                if !self.at_end()? && self.peek()? != Some(']') {
-                    let c = self.peek()?.unwrap();
-                    return Err(self.err(&format!("unexpected '{}'", c)).into());
-                }
-                break;
-            }
-
-            if self.at_end()? || self.peek()? == Some(']') {
-                break;
-            }
-
-            self.wsc()?;
-            if self.peek()? == Some(';') {
-                self.advance()?;
-            }
-            self.wsc()?;
-        }
-
-        Ok(())
-    }
-
-    // list = '[' _ [ items ] _ ']'
-    fn list<H: Handler>(&mut self, handler: &mut H) -> Result<(), H::Error> {
-        let open = self.pos;
-        self.advance()?; // skip [
-        self.wsc()?;
-        handler.list_start()?;
-        self.items(handler)?;
-        self.wsc()?;
-        if self.peek()? == Some(']') {
-            self.advance()?;
-            handler.list_end()?;
-            Ok(())
-        } else {
-            Err(Error::at("unclosed '['", open).into())
-        }
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_event().transpose()
     }
 }
 
@@ -495,9 +606,7 @@ mod tests {
     use crate::Value;
 
     fn p(input: &[u8]) -> Result<Value, Error> {
-        let mut builder = crate::ValueBuilder::new();
-        parse(input, &mut builder)?;
-        Ok(builder.finish())
+        crate::value::parse_to_value(input)
     }
 
     fn s(v: &str) -> Value {
@@ -651,5 +760,43 @@ mod tests {
     fn nbsp_in_raw_ok() {
         let v = p("name 'foo\u{00a0}bar'".as_bytes()).unwrap();
         assert_eq!(v["name"].as_str(), Some("foo\u{00a0}bar"));
+    }
+
+    #[test]
+    fn pull_parser_events() {
+        let mut parser = PhigParser::new("a 1\nb 2".as_bytes());
+        assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::Key("a".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::String("1".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::Key("b".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::String("2".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::EndMap);
+        assert!(parser.next().is_none());
+    }
+
+    #[test]
+    fn pull_parser_nested() {
+        let mut parser = PhigParser::new("x { a 1 }".as_bytes());
+        assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::Key("x".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::Key("a".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::String("1".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::EndMap);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::EndMap);
+        assert!(parser.next().is_none());
+    }
+
+    #[test]
+    fn pull_parser_list() {
+        let mut parser = PhigParser::new("tags [a b]".as_bytes());
+        assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::Key("tags".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::StartList);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::String("a".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::String("b".into()));
+        assert_eq!(parser.next().unwrap().unwrap(), Event::EndList);
+        assert_eq!(parser.next().unwrap().unwrap(), Event::EndMap);
+        assert!(parser.next().is_none());
     }
 }

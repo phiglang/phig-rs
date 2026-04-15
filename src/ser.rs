@@ -1,38 +1,17 @@
-use serde::ser::{self, Serialize, SerializeMap, SerializeSeq};
+use std::io;
+
+use serde::ser::{self, Impossible, Serialize};
 
 use crate::error::Error;
 use crate::fmt::Formatter;
-use crate::Value;
-
-impl Serialize for Value {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Value::String(s) => serializer.serialize_str(s),
-            Value::List(items) => {
-                let mut seq = serializer.serialize_seq(Some(items.len()))?;
-                for item in items {
-                    seq.serialize_element(item)?;
-                }
-                seq.end()
-            }
-            Value::Map(pairs) => {
-                let mut map = serializer.serialize_map(Some(pairs.len()))?;
-                for (k, v) in pairs {
-                    map.serialize_entry(k, v)?;
-                }
-                map.end()
-            }
-        }
-    }
-}
 
 /// Serialize a `T` to a phig writer.
 ///
 /// The value must serialize as a map (struct, `HashMap`, etc.).
-pub fn to_writer<T: Serialize>(value: &T, writer: impl std::io::Write) -> Result<(), Error> {
-    let val = to_value(value)?;
-    let mut fmt = Formatter::new(writer);
-    fmt.write_value(&val)
+pub fn to_writer<T: Serialize>(value: &T, writer: impl io::Write) -> Result<(), Error> {
+    let mut ser = StreamSerializer::new(writer);
+    value.serialize(&mut ser)?;
+    ser.fmt.into_inner().flush().map_err(Error::from)
 }
 
 /// Serialize a `T` to a phig string.
@@ -54,100 +33,125 @@ pub fn to_string<T: Serialize>(value: &T) -> Result<String, Error> {
     Ok(String::from_utf8(buf).expect("phig output is always valid UTF-8"))
 }
 
-/// Serialize a `T` to a [`Value`].
-///
-/// The value must serialize as a map.
-pub fn to_value<T: Serialize>(value: &T) -> Result<Value, Error> {
-    let val = value.serialize(ValueSerializer)?;
-    if !matches!(val, Value::Map(_)) {
-        return Err(Error::new("top-level value must be a map"));
-    }
-    Ok(val)
+struct StreamSerializer<W: io::Write> {
+    fmt: Formatter<W>,
+    depth: u32,
 }
 
-struct ValueSerializer;
+impl<W: io::Write> StreamSerializer<W> {
+    fn new(writer: W) -> Self {
+        StreamSerializer {
+            fmt: Formatter::new(writer),
+            depth: 0,
+        }
+    }
 
-impl ser::Serializer for ValueSerializer {
-    type Ok = Value;
+    fn require_nested(&self) -> Result<(), Error> {
+        if self.depth == 0 {
+            Err(Error::new("top-level value must be a map"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<'a, W: io::Write> ser::Serializer for &'a mut StreamSerializer<W> {
+    type Ok = ();
     type Error = Error;
-    type SerializeSeq = SeqCollector;
-    type SerializeTuple = SeqCollector;
-    type SerializeTupleStruct = SeqCollector;
-    type SerializeTupleVariant = TupleVariantCollector;
-    type SerializeMap = MapCollector;
-    type SerializeStruct = MapCollector;
-    type SerializeStructVariant = StructVariantCollector;
+    type SerializeSeq = CompoundSeq<'a, W>;
+    type SerializeTuple = CompoundSeq<'a, W>;
+    type SerializeTupleStruct = CompoundSeq<'a, W>;
+    type SerializeTupleVariant = CompoundTupleVariant<'a, W>;
+    type SerializeMap = CompoundMap<'a, W>;
+    type SerializeStruct = CompoundMap<'a, W>;
+    type SerializeStructVariant = CompoundStructVariant<'a, W>;
 
-    fn serialize_bool(self, v: bool) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_bool(self, v: bool) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_i8(self, v: i8) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_i8(self, v: i8) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_i16(self, v: i16) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_i16(self, v: i16) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_i32(self, v: i32) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_i32(self, v: i32) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_i64(self, v: i64) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_i64(self, v: i64) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_u8(self, v: u8) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_u8(self, v: u8) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_u16(self, v: u16) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_u16(self, v: u16) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_u32(self, v: u32) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_u32(self, v: u32) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_u64(self, v: u64) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_u64(self, v: u64) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_f32(self, v: f32) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_f32(self, v: f32) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_f64(self, v: f64) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_f64(self, v: f64) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_char(self, v: char) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_char(self, v: char) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_str(self, v: &str) -> Result<Value, Error> {
-        Ok(Value::String(v.to_string()))
+    fn serialize_str(self, v: &str) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(v.to_string())
     }
 
-    fn serialize_bytes(self, _v: &[u8]) -> Result<Value, Error> {
+    fn serialize_bytes(self, _v: &[u8]) -> Result<(), Error> {
         Err(Error::new("byte arrays are not supported"))
     }
 
-    fn serialize_none(self) -> Result<Value, Error> {
-        Ok(Value::String(String::new()))
+    fn serialize_none(self) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(String::new())
     }
 
-    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Value, Error> {
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<(), Error> {
         value.serialize(self)
     }
 
-    fn serialize_unit(self) -> Result<Value, Error> {
-        Ok(Value::String(String::new()))
+    fn serialize_unit(self) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(String::new())
     }
 
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value, Error> {
-        Ok(Value::String(String::new()))
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(String::new())
     }
 
     fn serialize_unit_variant(
@@ -155,15 +159,16 @@ impl ser::Serializer for ValueSerializer {
         _name: &'static str,
         _idx: u32,
         variant: &'static str,
-    ) -> Result<Value, Error> {
-        Ok(Value::String(variant.to_string()))
+    ) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.string(variant.to_string())
     }
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
         self,
         _name: &'static str,
         value: &T,
-    ) -> Result<Value, Error> {
+    ) -> Result<(), Error> {
         value.serialize(self)
     }
 
@@ -173,27 +178,39 @@ impl ser::Serializer for ValueSerializer {
         _idx: u32,
         variant: &'static str,
         value: &T,
-    ) -> Result<Value, Error> {
-        let inner = value.serialize(ValueSerializer)?;
-        Ok(Value::Map(vec![(variant.to_string(), inner)]))
+    ) -> Result<(), Error> {
+        self.require_nested()?;
+        self.fmt.map_start()?;
+        self.depth += 1;
+        self.fmt.key(variant.to_string())?;
+        value.serialize(&mut *self)?;
+        self.depth -= 1;
+        self.fmt.map_end()
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<SeqCollector, Error> {
-        Ok(SeqCollector {
-            items: Vec::with_capacity(len.unwrap_or(0)),
-        })
+    fn serialize_seq(self, _len: Option<usize>) -> Result<CompoundSeq<'a, W>, Error> {
+        self.require_nested()?;
+        self.fmt.list_start()?;
+        self.depth += 1;
+        Ok(CompoundSeq { ser: self })
     }
 
-    fn serialize_tuple(self, len: usize) -> Result<SeqCollector, Error> {
-        self.serialize_seq(Some(len))
+    fn serialize_tuple(self, _len: usize) -> Result<CompoundSeq<'a, W>, Error> {
+        self.require_nested()?;
+        self.fmt.list_start()?;
+        self.depth += 1;
+        Ok(CompoundSeq { ser: self })
     }
 
     fn serialize_tuple_struct(
         self,
         _name: &'static str,
-        len: usize,
-    ) -> Result<SeqCollector, Error> {
-        self.serialize_seq(Some(len))
+        _len: usize,
+    ) -> Result<CompoundSeq<'a, W>, Error> {
+        self.require_nested()?;
+        self.fmt.list_start()?;
+        self.depth += 1;
+        Ok(CompoundSeq { ser: self })
     }
 
     fn serialize_tuple_variant(
@@ -201,23 +218,31 @@ impl ser::Serializer for ValueSerializer {
         _name: &'static str,
         _idx: u32,
         variant: &'static str,
-        len: usize,
-    ) -> Result<TupleVariantCollector, Error> {
-        Ok(TupleVariantCollector {
-            variant: variant.to_string(),
-            items: Vec::with_capacity(len),
-        })
+        _len: usize,
+    ) -> Result<CompoundTupleVariant<'a, W>, Error> {
+        self.require_nested()?;
+        self.fmt.map_start()?;
+        self.depth += 1;
+        self.fmt.key(variant.to_string())?;
+        self.fmt.list_start()?;
+        self.depth += 1;
+        Ok(CompoundTupleVariant { ser: self })
     }
 
-    fn serialize_map(self, len: Option<usize>) -> Result<MapCollector, Error> {
-        Ok(MapCollector {
-            pairs: Vec::with_capacity(len.unwrap_or(0)),
-            key: None,
-        })
+    fn serialize_map(self, _len: Option<usize>) -> Result<CompoundMap<'a, W>, Error> {
+        self.fmt.map_start()?;
+        self.depth += 1;
+        Ok(CompoundMap { ser: self })
     }
 
-    fn serialize_struct(self, _name: &'static str, len: usize) -> Result<MapCollector, Error> {
-        self.serialize_map(Some(len))
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<CompoundMap<'a, W>, Error> {
+        self.fmt.map_start()?;
+        self.depth += 1;
+        Ok(CompoundMap { ser: self })
     }
 
     fn serialize_struct_variant(
@@ -225,112 +250,87 @@ impl ser::Serializer for ValueSerializer {
         _name: &'static str,
         _idx: u32,
         variant: &'static str,
-        len: usize,
-    ) -> Result<StructVariantCollector, Error> {
-        Ok(StructVariantCollector {
-            variant: variant.to_string(),
-            pairs: Vec::with_capacity(len),
-        })
+        _len: usize,
+    ) -> Result<CompoundStructVariant<'a, W>, Error> {
+        self.require_nested()?;
+        self.fmt.map_start()?;
+        self.depth += 1;
+        self.fmt.key(variant.to_string())?;
+        self.fmt.map_start()?;
+        self.depth += 1;
+        Ok(CompoundStructVariant { ser: self })
     }
 }
 
-struct SeqCollector {
-    items: Vec<Value>,
+struct CompoundSeq<'a, W: io::Write> {
+    ser: &'a mut StreamSerializer<W>,
 }
 
-impl ser::SerializeSeq for SeqCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeSeq for CompoundSeq<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
-        self.items.push(value.serialize(ValueSerializer)?);
-        Ok(())
+        value.serialize(&mut *self.ser)
     }
 
-    fn end(self) -> Result<Value, Error> {
-        Ok(Value::List(self.items))
+    fn end(self) -> Result<(), Error> {
+        self.ser.depth -= 1;
+        self.ser.fmt.list_end()
     }
 }
 
-impl ser::SerializeTuple for SeqCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeTuple for CompoundSeq<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
         ser::SerializeSeq::serialize_element(self, value)
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<(), Error> {
         ser::SerializeSeq::end(self)
     }
 }
 
-impl ser::SerializeTupleStruct for SeqCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeTupleStruct for CompoundSeq<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
         ser::SerializeSeq::serialize_element(self, value)
     }
 
-    fn end(self) -> Result<Value, Error> {
+    fn end(self) -> Result<(), Error> {
         ser::SerializeSeq::end(self)
     }
 }
 
-struct TupleVariantCollector {
-    variant: String,
-    items: Vec<Value>,
+struct CompoundMap<'a, W: io::Write> {
+    ser: &'a mut StreamSerializer<W>,
 }
 
-impl ser::SerializeTupleVariant for TupleVariantCollector {
-    type Ok = Value;
-    type Error = Error;
-
-    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
-        self.items.push(value.serialize(ValueSerializer)?);
-        Ok(())
-    }
-
-    fn end(self) -> Result<Value, Error> {
-        Ok(Value::Map(vec![(self.variant, Value::List(self.items))]))
-    }
-}
-
-struct MapCollector {
-    pairs: Vec<(String, Value)>,
-    key: Option<String>,
-}
-
-impl ser::SerializeMap for MapCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeMap for CompoundMap<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), Error> {
-        let val = key.serialize(ValueSerializer)?;
-        self.key = Some(match val {
-            Value::String(s) => s,
-            _ => return Err(Error::new("map keys must be strings")),
-        });
-        Ok(())
+        let k = key.serialize(KeySerializer)?;
+        self.ser.fmt.key(k)
     }
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
-        let key = self
-            .key
-            .take()
-            .ok_or_else(|| Error::new("serialize_value without key"))?;
-        self.pairs.push((key, value.serialize(ValueSerializer)?));
-        Ok(())
+        value.serialize(&mut *self.ser)
     }
 
-    fn end(self) -> Result<Value, Error> {
-        Ok(Value::Map(self.pairs))
+    fn end(self) -> Result<(), Error> {
+        self.ser.depth -= 1;
+        self.ser.fmt.map_end()
     }
 }
 
-impl ser::SerializeStruct for MapCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeStruct for CompoundMap<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_field<T: Serialize + ?Sized>(
@@ -338,23 +338,42 @@ impl ser::SerializeStruct for MapCollector {
         key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
-        self.pairs
-            .push((key.to_string(), value.serialize(ValueSerializer)?));
-        Ok(())
+        self.ser.fmt.key(key.to_string())?;
+        value.serialize(&mut *self.ser)
     }
 
-    fn end(self) -> Result<Value, Error> {
-        Ok(Value::Map(self.pairs))
+    fn end(self) -> Result<(), Error> {
+        self.ser.depth -= 1;
+        self.ser.fmt.map_end()
     }
 }
 
-struct StructVariantCollector {
-    variant: String,
-    pairs: Vec<(String, Value)>,
+struct CompoundTupleVariant<'a, W: io::Write> {
+    ser: &'a mut StreamSerializer<W>,
 }
 
-impl ser::SerializeStructVariant for StructVariantCollector {
-    type Ok = Value;
+impl<W: io::Write> ser::SerializeTupleVariant for CompoundTupleVariant<'_, W> {
+    type Ok = ();
+    type Error = Error;
+
+    fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), Error> {
+        value.serialize(&mut *self.ser)
+    }
+
+    fn end(self) -> Result<(), Error> {
+        self.ser.depth -= 1;
+        self.ser.fmt.list_end()?;
+        self.ser.depth -= 1;
+        self.ser.fmt.map_end()
+    }
+}
+
+struct CompoundStructVariant<'a, W: io::Write> {
+    ser: &'a mut StreamSerializer<W>,
+}
+
+impl<W: io::Write> ser::SerializeStructVariant for CompoundStructVariant<'_, W> {
+    type Ok = ();
     type Error = Error;
 
     fn serialize_field<T: Serialize + ?Sized>(
@@ -362,13 +381,176 @@ impl ser::SerializeStructVariant for StructVariantCollector {
         key: &'static str,
         value: &T,
     ) -> Result<(), Error> {
-        self.pairs
-            .push((key.to_string(), value.serialize(ValueSerializer)?));
-        Ok(())
+        self.ser.fmt.key(key.to_string())?;
+        value.serialize(&mut *self.ser)
     }
 
-    fn end(self) -> Result<Value, Error> {
-        Ok(Value::Map(vec![(self.variant, Value::Map(self.pairs))]))
+    fn end(self) -> Result<(), Error> {
+        self.ser.depth -= 1;
+        self.ser.fmt.map_end()?;
+        self.ser.depth -= 1;
+        self.ser.fmt.map_end()
+    }
+}
+
+struct KeySerializer;
+
+impl ser::Serializer for KeySerializer {
+    type Ok = String;
+    type Error = Error;
+    type SerializeSeq = Impossible<String, Error>;
+    type SerializeTuple = Impossible<String, Error>;
+    type SerializeTupleStruct = Impossible<String, Error>;
+    type SerializeTupleVariant = Impossible<String, Error>;
+    type SerializeMap = Impossible<String, Error>;
+    type SerializeStruct = Impossible<String, Error>;
+    type SerializeStructVariant = Impossible<String, Error>;
+
+    fn serialize_bool(self, v: bool) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_i8(self, v: i8) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_i16(self, v: i16) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_i32(self, v: i32) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_i64(self, v: i64) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_u8(self, v: u8) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_u16(self, v: u16) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_u32(self, v: u32) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_u64(self, v: u64) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_f32(self, v: f32) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_f64(self, v: f64) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_char(self, v: char) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_str(self, v: &str) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_bytes(self, _v: &[u8]) -> Result<String, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_none(self) -> Result<String, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<String, Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> Result<String, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<String, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        variant: &'static str,
+    ) -> Result<String, Error> {
+        Ok(variant.to_string())
+    }
+
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<String, Error> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _value: &T,
+    ) -> Result<String, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_tuple(self, _len: usize) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_map(self, _len: Option<usize>) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Impossible<String, Error>, Error> {
+        Err(Error::new("map keys must be strings"))
     }
 }
 
