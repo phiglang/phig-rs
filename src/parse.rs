@@ -155,8 +155,6 @@ impl<R: Read> Parser<R> {
         }
     }
 
-    // ── grammar-level helpers ──────────────────────────────────────
-
     /// Parses a key at the start of a pair, checks for duplicates,
     /// consumes trailing HSPACE, and returns [`Event::Key`].
     fn parse_key(&mut self) -> Result<Event, Error> {
@@ -304,8 +302,6 @@ impl<R: Read> Parser<R> {
             };
         }
     }
-
-    // ── low-level scanning ──────────────────────────────────────────
 
     /// Ensure at least `n` bytes in the lookahead buffer.
     fn fill(&mut self, n: usize) -> Result<usize, Error> {
