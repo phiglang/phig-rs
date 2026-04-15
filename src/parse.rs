@@ -5,7 +5,7 @@ use std::io::Read;
 
 use crate::error::Error;
 
-/// Events emitted by [`PhigParser`].
+/// Events emitted by [`Parser`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     StartMap,
@@ -18,7 +18,7 @@ pub enum Event {
 
 /// Pull-based parser for the phig configuration language.
 ///
-/// Each call to [`next`](PhigParser::next) returns the next parse [`Event`],
+/// Each call to [`next`](Parser::next) returns the next parse [`Event`],
 /// or `None` when the input is fully consumed.
 ///
 /// Parser states correspond to positions in the grammar:
@@ -31,7 +31,7 @@ pub enum Event {
 ///   list     = '[' _ [items] _ ']'
 ///   items    = value { _ [';'] _ value }
 /// ```
-pub struct PhigParser<R: Read> {
+pub struct Parser<R: Read> {
     reader: R,
     buf: Vec<u8>,
     pos: usize,
@@ -64,10 +64,10 @@ struct Frame {
     seen: Option<HashSet<String>>,
 }
 
-impl<R: Read> PhigParser<R> {
+impl<R: Read> Parser<R> {
     /// Create a new parser that reads from `reader`.
     pub fn new(reader: R) -> Self {
-        PhigParser {
+        Parser {
             reader,
             buf: Vec::new(),
             pos: 0,
@@ -592,7 +592,7 @@ impl<R: Read> PhigParser<R> {
     }
 }
 
-impl<R: Read> Iterator for PhigParser<R> {
+impl<R: Read> Iterator for Parser<R> {
     type Item = Result<Event, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn pull_parser_events() {
-        let mut parser = PhigParser::new("a 1\nb 2".as_bytes());
+        let mut parser = Parser::new("a 1\nb 2".as_bytes());
         assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
         assert_eq!(parser.next().unwrap().unwrap(), Event::Key("a".into()));
         assert_eq!(parser.next().unwrap().unwrap(), Event::String("1".into()));
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn pull_parser_nested() {
-        let mut parser = PhigParser::new("x { a 1 }".as_bytes());
+        let mut parser = Parser::new("x { a 1 }".as_bytes());
         assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
         assert_eq!(parser.next().unwrap().unwrap(), Event::Key("x".into()));
         assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
@@ -789,7 +789,7 @@ mod tests {
 
     #[test]
     fn pull_parser_list() {
-        let mut parser = PhigParser::new("tags [a b]".as_bytes());
+        let mut parser = Parser::new("tags [a b]".as_bytes());
         assert_eq!(parser.next().unwrap().unwrap(), Event::StartMap);
         assert_eq!(parser.next().unwrap().unwrap(), Event::Key("tags".into()));
         assert_eq!(parser.next().unwrap().unwrap(), Event::StartList);

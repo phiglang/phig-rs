@@ -4,7 +4,7 @@ pub(crate) mod de;
 pub(crate) mod ser;
 
 use crate::error::Error;
-use crate::parse::{Event, PhigParser};
+use crate::parse::{Event, Parser};
 
 /// A dynamically-typed phig value.
 ///
@@ -82,7 +82,7 @@ pub(crate) fn parse_to_value(reader: impl std::io::Read) -> Result<Value, Error>
         },
     }
 
-    let mut parser = PhigParser::new(reader);
+    let mut parser = Parser::new(reader);
     let mut stack: Vec<Frame> = Vec::new();
     let mut result: Option<Value> = None;
 

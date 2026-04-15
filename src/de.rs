@@ -3,7 +3,7 @@ use std::io::Read;
 use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
 
 use crate::error::Error;
-use crate::parse::{Event, PhigParser};
+use crate::parse::{Event, Parser};
 
 /// Deserialize a `T` from a phig reader.
 pub fn from_reader<T: serde::de::DeserializeOwned>(reader: impl Read) -> Result<T, Error> {
@@ -27,14 +27,14 @@ pub fn from_str<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Error> {
 }
 
 struct StreamDeserializer<R: Read> {
-    parser: PhigParser<R>,
+    parser: Parser<R>,
     peeked: Option<Event>,
 }
 
 impl<R: Read> StreamDeserializer<R> {
     fn new(reader: R) -> Self {
         StreamDeserializer {
-            parser: PhigParser::new(reader),
+            parser: Parser::new(reader),
             peeked: None,
         }
     }
